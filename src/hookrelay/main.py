@@ -8,10 +8,14 @@ from fastapi import FastAPI
 
 from hookrelay.api.health import router as health_router
 from hookrelay.config import Settings, get_settings
+from hookrelay.database import DatabaseHealth, PostgresDatabase
 from hookrelay.logging import configure_logging
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    database: DatabaseHealth | None = None,
+) -> FastAPI:
     """Build an application instance with explicit, testable dependencies."""
 
     app_settings = settings or get_settings()
@@ -19,7 +23,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app_database = database or PostgresDatabase(app_settings)
         app.state.settings = app_settings
+        app.state.database = app_database
         logger.info(
             "application_started",
             extra={"service": app_settings.service_name, "version": app_settings.version},
@@ -27,7 +33,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
-            logger.info("application_stopped", extra={"service": app_settings.service_name})
+            await app_database.dispose()
+            logger.info(
+                "application_stopped",
+                extra={"service": app_settings.service_name},
+            )
 
     app = FastAPI(
         title="HookRelay API",
@@ -50,4 +60,5 @@ def run() -> None:
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level.lower(),
+        loop="asyncio",
     )

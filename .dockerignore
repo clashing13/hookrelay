@@ -1,0 +1,28 @@
+.git
+.github
+.venv
+.uv-cache
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Local configuration can contain credentials. Only the safe template belongs
+# in the build context.
+.env
+.env.*
+!.env.example
+
+# Development-only files do not belong in the runtime image.
+tests
+docs
+build
+dist
+*.egg-info
+.idea
+.vscode
+.DS_Store
+Thumbs.db

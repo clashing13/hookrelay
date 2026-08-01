@@ -22,3 +22,4 @@ async def test_openapi_contains_liveness_route(client: AsyncClient) -> None:
 
     assert response.status_code == 200
     assert "/health/live" in response.json()["paths"]
+    assert "/health/ready" in response.json()["paths"]

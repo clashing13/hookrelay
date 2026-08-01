@@ -6,8 +6,6 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from hookrelay import __version__
-
 
 class Settings(BaseSettings):
     """Validated process configuration loaded from ``HOOKRELAY_*`` variables."""
@@ -18,10 +16,11 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
-    service_name: str = "hookrelay"
-    version: str = __version__
+    service_name: Literal["hookrelay"] = "hookrelay"
+    version: Literal["0.1.0"] = "0.1.0"
     environment: Literal["local", "test", "staging", "production"] = "local"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     host: str = "127.0.0.1"
