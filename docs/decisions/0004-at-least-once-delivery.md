@@ -1,6 +1,6 @@
 # ADR 0004: At-least-once delivery instead of exactly-once claims
 
-- Status: Accepted for the future delivery pipeline
+- Status: Accepted; delivery execution remains future work
 - Date: 2026-08-01
 
 ## Context
@@ -26,8 +26,11 @@ idempotency, such as recording that ID under a unique constraint in the same
 transaction as the receiver's side effect. Never describe HookRelay as a
 general-purpose exactly-once system.
 
-This ADR defines future semantics. Stage 1 has no ingestion endpoint, outbox,
-broker, worker, or webhook delivery behavior yet.
+Stage 2 now implements the durable front half of this decision: event
+acceptance, stable event IDs, pending delivery records, and transactional
+outbox rows. It has no outbox publisher, NATS broker integration, worker,
+outbound webhook request, retry, or attempt row creation. Durable acceptance is
+therefore not evidence that at-least-once delivery has executed yet.
 
 ## Serious alternatives
 
@@ -53,6 +56,6 @@ than solve it.
 - Delivery attempts and logical events must be modeled separately.
 - Metrics must distinguish events, attempts, successful acknowledgments, and
   duplicate observations.
-- The transactional outbox planned for Stage 2 and broker/worker planned for
-  Stage 3 reduce loss windows, but neither removes HTTP acknowledgment
-  ambiguity.
+- The Stage 2 transactional outbox and Stage 3 broker/worker reduce different
+  loss windows, but neither removes broker acknowledgment or HTTP
+  acknowledgment ambiguity.

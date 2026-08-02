@@ -1,296 +1,431 @@
 # HookRelay interview guide
 
-This is a cumulative speaking guide, not a script to memorize. Strong answers
-state the problem, name the invariant, trace the mechanism, discuss a serious
-alternative, and acknowledge what has not been proved.
+This guide turns the implemented system into precise interview explanations.
+Lead with an invariant and evidence, then state the boundary. Avoid reciting a
+tool list or claiming roadmap behavior as complete.
 
-## Honest project pitch
+## Thirty-second Stage 2 pitch
 
-### One sentence
+> HookRelay is a webhook-delivery learning project. Through Stage 2 it accepts
+> authenticated tenant events idempotently and commits each event, its per-target
+> delivery snapshots, and transactional-outbox rows atomically in PostgreSQL.
+> Matching retries return the original IDs with `201` and an explicit replay
+> header; conflicting key reuse is `409`, and a database uniqueness constraint
+> closes concurrent races. API keys are hash-only, signing secrets are encrypted
+> because they must be recoverable, and tenant relationships are constrained in
+> the schema. It does not publish to NATS or send webhooks yet, so I call this
+> durable ingestion, not delivery.
 
-HookRelay is a staged fault-tolerant webhook delivery platform I am building to
-practice durable state, explicit delivery semantics, failure recovery,
-concurrency, security, observability, and measurement.
+## Ninety-second architecture answer
 
-### Thirty-second Stage 1 version
+1. Stage 1 created the FastAPI lifecycle, validated configuration, separate
+   liveness/readiness probes, process-scoped async engine, explicit Alembic
+   boundary, Compose topology, and layered tests.
+2. A deployment-only bootstrap route creates a tenant and one raw API key. The
+   raw key is returned once; only its public ID, SHA-256 secret digest, and hint
+   are stored.
+3. Tenant routes authenticate bearer keys and derive the tenant internally.
+   Callers never choose a tenant ID.
+4. Endpoint creation generates a signing secret, encrypts it with AES-256-GCM,
+   and returns it once. A future worker must recover that secret to sign HTTP.
+5. Event submission requires an idempotency header. HookRelay hashes a
+   canonical versioned request and uses a tenant/key unique constraint plus
+   PostgreSQL `ON CONFLICT` to make retries safe across concurrent API replicas.
+6. The successful transaction creates one event, one pending delivery per
+   endpoint, and one unpublished outbox row per delivery. Only after commit does
+   the route return `201`.
+7. There is no publisher, NATS, worker, outbound HTTP, or delivery attempt yet.
+   That deliberate boundary makes the durable handoff inspectable before
+   introducing another system.
 
-Stage 1 establishes a deployable Python/FastAPI foundation. It validates
-environment configuration, emits HookRelay-owned log records as JSON, owns one
-asynchronous SQLAlchemy engine per process, and separates dependency-free
-liveness from a bounded real PostgreSQL readiness query. It disposes resources
-during shutdown, uses explicit Alembic migrations, and reproduces the topology
-with non-root Docker and Compose. Async API tests, real-PostgreSQL integration
-tests, migration checks, and CI cover different boundaries. Event ingestion and
-webhook delivery are not implemented yet.
+## Whiteboard trace
 
-### Future product version
+Draw this without adding roadmap components inside the current boundary:
 
-When the later stages are complete, a producer submits an event, PostgreSQL
-stores it with a transactional outbox, a publisher moves committed work to
-NATS JetStream, and bounded workers send HMAC-signed HTTP requests with retry
-and dead-letter behavior. The intended guarantee is at least once, so stable
-event IDs and receiver-side idempotency address duplicate effects.
+```text
+Producer
+  -> FastAPI: validate JSON + headers
+  -> API-key lookup/digest verification -> tenant context
+  -> canonical request fingerprint
+  -> tenant-scoped endpoint/secret lookup
+  -> PostgreSQL transaction
+       event
+       + N pending delivery snapshots
+       + N unpublished outbox rows
+  -> commit
+  -> 201 Created
 
-Do not use the future version as a claim about the Stage 1 code.
+Matching retry -> original response + Idempotency-Replayed: true
+Changed retry  -> 409 idempotency_key_reused
 
-## A strong-answer shape
+Outbox publisher / NATS / HTTP worker: not implemented
+```
 
-Use this sequence for a two-minute technical answer:
-
-1. **Problem:** Name the failure or constraint.
-2. **Invariant:** State what must remain true.
-3. **Mechanism:** Trace the actual code/configuration path.
-4. **Evidence:** Cite the test or observation that exercises it.
-5. **Tradeoff:** Compare one credible alternative.
-6. **Boundary:** Say what the evidence does not prove.
-
-Example: "A database outage should remove an instance from dependency-backed
-traffic without causing an API restart storm. Therefore liveness never touches
-PostgreSQL, while readiness runs a bounded `SELECT 1`. A controlled failure
-test makes readiness return a sanitized `503` while liveness remains `200`; a
-real integration test proves the success path, and the Compose exercise
-observes recovery after PostgreSQL returns. This proves the probe behavior, not
-production capacity or every domain query."
-
-## Stage 1 questions and strong-answer ingredients
-
-### What problem does HookRelay solve?
-
-- A producer should not silently lose a webhook because the destination or
-  network is temporarily unavailable.
-- HookRelay will durably record work and retry delivery in later stages.
-- It does not repair the receiver and cannot remove acknowledgment ambiguity.
-- Stage 1 only supplies the service and dependency foundation.
-
-### Why Python rather than Go?
-
-- The core learning target is distributed-systems reasoning within seven
-  focused stages.
-- Existing Python/FastAPI fluency preserves time for correctness and failure
-  work.
-- The workload is largely I/O-bound and has maintained async libraries.
-- Go is a serious worker alternative because of goroutines, static deployment,
-  and resource efficiency.
-- Benchmark first; a Go worker is a possible post-MVP experiment, not an
-  intuition-driven rewrite.
-
-### What does `async def` buy you?
-
-- A coroutine can yield to the event loop while genuine async I/O waits.
-- This permits concurrency without one thread per request.
-- It does not make CPU-heavy work parallel.
-- Calling a blocking driver inside `async def` still blocks the loop.
-- Concurrency must be bounded later to protect memory, connection pools, and
-  destinations.
-
-### Why an application factory?
-
-- Construction is explicit: settings, database ownership, routes, and lifespan
-  are wired in one place.
-- Tests can build isolated applications with controlled dependencies.
-- It avoids relying solely on import-time global state.
-- A module-level ASGI app can still be exported for Uvicorn; the factory remains
-  the construction mechanism.
+## Stage 1 foundation questions
 
 ### Why separate liveness and readiness?
 
-- Liveness asks whether the process can answer; readiness asks whether it can
-  serve dependency-backed traffic.
-- If liveness queried PostgreSQL, an outage could make an orchestrator restart
-  healthy API processes, add connection pressure, and fail to repair the DB.
-- Readiness executes a real, timeout-bounded `SELECT 1`, returns `503` on
-  dependency failure, sanitizes its public response, and probes again on the
-  next request so it can recover.
+- Liveness asks whether the process/event loop can answer and touches no
+  external dependency.
+- Readiness executes a timeout-bounded real PostgreSQL `SELECT 1`.
+- If liveness depended on PostgreSQL, a database outage could trigger mass API
+  restarts that do not repair the database and may add a connection storm.
+- Readiness returns sanitized `503` during the outage and rechecks on every
+  request, so it can recover without process restart.
 
-### Does `SELECT 1` prove the application works?
+### Why one engine but one session per request?
 
-- It proves basic connectivity, authentication, connection checkout, and query
-  execution through the real stack.
-- It does not prove domain tables exist, migrations are current, complex queries
-  work, or there is enough capacity under load.
-- Later stages may add deeper startup or operational checks without making
-  liveness dependency-bound.
+- The async engine and pool are process-scoped reusable infrastructure.
+- A session contains mutable identity-map, transaction, pending-write, commit,
+  and rollback state.
+- A global session could interleave unrelated requests and let one request
+  commit or roll back another's work.
+- Each domain request therefore receives a short-lived session and returns the
+  borrowed connection promptly.
 
-### Why one SQLAlchemy engine but not one global session?
+### Why PostgreSQL rather than SQLite or MongoDB?
 
-- The engine is process-scoped infrastructure and owns a reusable connection
-  pool.
-- A session carries mutable transaction/unit-of-work state.
-- Sharing one session across unrelated concurrent requests can interleave
-  transactions and corrupt isolation assumptions.
-- Later operations create short-lived sessions and return connections promptly.
-
-### Why PostgreSQL instead of SQLite?
-
-- Later stages need concurrent multi-process transactions, relational
-  constraints, unique idempotency rules, and a transactional outbox.
-- SQLite is excellent for embedded use and fast tests, but its locking,
-  transaction behavior, SQL, and types differ.
-- PostgreSQL integration tests prevent a false sense of confidence from a
-  substitute database.
-
-### Why not MongoDB?
-
-- HookRelay's tenant, endpoint, event, delivery, attempt, and outbox data has
-  strong relational constraints and transaction boundaries.
-- MongoDB is credible for document-oriented requirements and offers
-  transactions in supported topologies.
-- No current requirement offsets the cost of a different consistency and query
-  model.
+- The current design relies on concurrent multi-process transactions,
+  `ON CONFLICT`, JSONB, partial indexes, relational constraints, composite
+  tenant foreign keys, and a transactional outbox.
+- SQLite is excellent for embedded or small local workloads, but it would not
+  exercise the production concurrency, locking, type, and SQL behavior.
+- MongoDB supports transactions in suitable deployments, but this domain is
+  strongly relational and no document-model requirement offsets a second set
+  of consistency/query tradeoffs.
 
 ### Why Alembic rather than `metadata.create_all()`?
 
-- Models describe the current desired shape; a live database has historical
-  versions and data.
-- `create_all()` creates missing objects but is not an ordered, reviewable data
-  transition.
-- Alembic records revisions and supports deliberate DDL/data movement.
-- Migrations run as an explicit release step, avoiding replica startup races.
-- Stage 1 correctly has no empty revision; Stage 2 will add the first meaningful
-  schema.
+- ORM models describe what code expects now; a live database contains history
+  and data.
+- `create_all()` can create missing objects but does not express an ordered
+  rename, backfill, staged constraint, or reviewed transition.
+- Stage 2 has an explicit first domain revision; `alembic check` also looks for
+  model/migration drift.
+- Migrations run before traffic as a release step, not concurrently inside
+  every API replica's startup.
 
-### What does dependency locking prove?
+### What does async buy, and what does it not buy?
 
-- `uv.lock` records an exact resolved graph so CI and clean checkouts install
-  the same dependency set with `uv sync --frozen`.
-- The project still needs an intentional update and vulnerability-review
-  process.
-- A lockfile does not make upstream software correct or automatically secure.
+- Async drivers yield the event loop while network I/O waits, allowing other
+  requests to progress without a thread per wait.
+- `async def` is not parallel execution and does not make blocking code safe.
+- Database pools and future worker concurrency still need explicit bounds.
 
-### What is the difference between a Dockerfile, image, and container?
+## Stage 2 design questions
 
-- A Dockerfile is a recipe.
-- An image is the immutable layered build result.
-- A container is a running process created from the image.
-- On Windows, Linux containers share Docker Desktop's WSL 2 Linux VM kernel;
-  each container is not its own full VM.
+### What does `201 Created` mean for an event?
 
-### What does running as non-root accomplish?
+- PostgreSQL committed the logical event, all requested delivery snapshots, and
+  one unpublished outbox message per delivery.
+- The response is emitted only after commit.
+- It does not mean an outbox message was published, a worker ran, an HTTP
+  request was made, or the destination acknowledged anything.
+- A matching replay is also `201`, with the original representation and an
+  explicit replay header.
 
-- It limits what a compromised application process can modify inside the
-  container and reduces some host-impact paths.
-- It is defense in depth, not a security boundary that excuses vulnerable code,
-  broad mounts, excessive capabilities, or poor secret handling.
+### Why return `201` again on an idempotent replay?
 
-### Does Compose `depends_on` keep the database healthy?
+- The route reproduces the result of the original create operation rather than
+  exposing a second resource or switching response schema.
+- Stable status/body/`Location` make lost-response retries simple for clients.
+- `Idempotency-Replayed: true` provides observability without changing the
+  representation.
+- Other APIs sometimes choose `200`; the important part is a documented,
+  tested contract. HookRelay's exact choice is `201`.
 
-- A health-conditioned dependency can gate initial API startup until PostgreSQL
-  first becomes healthy.
-- It does not guarantee PostgreSQL remains healthy for the API lifetime.
-- The application must tolerate later failures; readiness reports them and must
-  recover when the dependency returns.
+### How is idempotency defined?
 
-### Why JSON logs?
+- Scope is `(authenticated tenant, Idempotency-Key)`.
+- The logical request includes operation, type, payload, and endpoint set under
+  a versioned canonicalization rule.
+- JSON object-key order and endpoint-list order do not change the fingerprint;
+  payload array order does.
+- Same key and same fingerprint returns original event/delivery IDs.
+- Same key and different fingerprint returns
+  `409 idempotency_key_reused` and creates nothing.
 
-- Stable fields are easier for log systems to filter and aggregate than parsed
-  prose.
-- Stage 1 includes process events and internal readiness diagnostics.
-- Secrets and raw database URLs must remain absent.
-- Correlation IDs, tracing, metrics, and dashboards arrive in Stage 6.
+### Why store a request fingerprint instead of only the key?
 
-### Why HTTPX2 and an explicit lifespan manager in API tests?
+- A key alone cannot distinguish a safe network retry from a caller bug that
+  accidentally reuses the key for different work.
+- Silently returning the old event for changed input would make the producer
+  believe new work was accepted when it was not.
+- The versioned SHA-256 fingerprint makes comparison compact and lets the
+  canonicalization contract evolve deliberately.
 
-- An async client matches the async application and avoids a deprecated legacy
-  client path in the resolved FastAPI/Starlette stack.
-- ASGI transport tests HTTP behavior without a real socket.
-- In-process transports do not necessarily trigger ASGI lifespan, so the
-  manager explicitly runs startup and shutdown.
-- These tests still do not prove DNS, host ports, TLS, or container networking.
+### What closes the concurrent idempotency race?
 
-### What does CI cover, and what can it miss?
+- The preliminary lookup is not enough: two transactions can both observe no
+  row.
+- PostgreSQL uniquely constrains `(tenant_id, idempotency_key)` across all
+  processes.
+- `INSERT ... ON CONFLICT DO NOTHING RETURNING` elects one winner.
+- A loser loads the committed winner and compares fingerprints, producing a
+  replay or `409`.
+- Correctness therefore lives at the shared serialization point, not in a
+  process-local lock or Python conditional.
 
-- Ruff checks lint and formatting; mypy checks static interfaces; pytest checks
-  behavior; real PostgreSQL tests exercise integration; Alembic validates the
-  migration path; Docker builds the Linux artifact.
-- A standard Ubuntu runner makes clean-environment errors visible.
-- CI does not prove production load, long-lived reliability, cloud policy,
-  receiver compatibility, or absence of every vulnerability.
+### Why a transactional outbox?
 
-### Can HookRelay guarantee exactly once?
+- Committing PostgreSQL and publishing directly to a broker are two independent
+  writes.
+- Database-first can crash before publish and lose dispatch; broker-first can
+  expose work whose database transaction rolls back.
+- Writing an outbox row in the same PostgreSQL transaction makes accepted
+  domain work and publish intent atomic.
+- A later publisher still may publish twice if it crashes after broker success
+  but before recording `published_at`, so consumers must remain idempotent.
+- Stage 2 has no publisher or broker; outbox rows remain unpublished.
 
-- Not across HTTP and an independent receiver database.
-- The receiver may commit and its acknowledgment may be lost.
-- Retrying yields at-least-once delivery; not retrying risks loss.
-- A stable event ID plus a receiver-side unique record in the same transaction
-  as its side effect can provide effectively-once business behavior.
-- Delivery is future-stage work, not a Stage 1 feature.
+### Why one outbox row per delivery rather than one per event?
 
-## Recruiter-oriented questions
+- One event can target several independently deliverable endpoints.
+- Per-delivery messages give a future worker one scheduling/retry identity per
+  destination.
+- The unique `(delivery_id, topic)` constraint prevents duplicate dispatch facts
+  for the current topic.
+- The versioned ID-only payload avoids putting event bodies or signing secrets
+  on a future broker.
 
-### "What was the most important design decision?"
+### Why snapshot URL and signing-secret version on the delivery?
 
-Choose one real invariant rather than listing tools. Good options at Stage 1:
+- Endpoint configuration can change after an event is accepted.
+- Historical work should preserve the destination and credential version that
+  were selected at acceptance time.
+- A foreign key to the versioned secret keeps the encrypted material in one
+  place while preventing retirement/deletion from invalidating accepted work.
+- Snapshotting all secret plaintext into each row would enlarge exposure and
+  duplicate sensitive material.
 
-- separating liveness from readiness to prevent restart amplification;
-- using the production database in integration tests;
-- keeping migrations explicit and outside process startup;
-- selecting Python to optimize learning velocity while reserving benchmarks for
-  performance claims.
+### Why hash API keys but encrypt endpoint signing secrets?
 
-Explain the alternative and the failure that the choice prevents.
+- An inbound API key needs only one-way verification, so storing a digest
+  avoids retaining recoverable raw credentials.
+- The API-key secret has 256 random bits, so SHA-256 digest storage is not
+  relying on low-entropy password hashing.
+- A future sender must recover an endpoint signing secret to compute an HMAC,
+  so one-way hashing would make delivery impossible.
+- AES-256-GCM supplies confidentiality and integrity; associated data binds the
+  ciphertext to its tenant/endpoint/secret/version context.
+- The encryption key remains a production secret-management responsibility.
 
-### "Tell me about a failure you tested."
+### How is tenant isolation enforced?
 
-Use the safe PostgreSQL outage exercise:
+- Authentication derives `tenant_id` from the verified API key; callers do not
+  submit it.
+- Every resource query includes the derived tenant scope.
+- Missing and cross-tenant resources share an opaque `404` response.
+- Composite foreign keys repeat tenant identity across relationships so the
+  database rejects a cross-tenant event/API-key, delivery/endpoint, or
+  delivery/secret association.
+- Application checks and database constraints are defense in depth, not
+  interchangeable layers.
 
-- Establish both probes at `200`.
-- Stop PostgreSQL without stopping the API.
-- Observe readiness become sanitized `503` while liveness remains `200`.
-- Restart PostgreSQL and observe readiness recover without API restart.
-- Connect the observation to orchestrator routing and incident amplification.
+### Why return endpoint signing secrets only once?
 
-Do not claim that this one exercise proves worker crash recovery; workers do not
-exist yet.
+- Repeated plaintext reads expand the number of places and requests that can
+  leak the credential.
+- Creation returns it under no-store headers so the client can provision its
+  receiver.
+- Later reads return only non-secret metadata.
+- HookRelay still stores encrypted ciphertext for future HMAC computation; the
+  phrase “only once” applies to the public API response, not internal
+  recoverability.
 
-### "How did you know it worked?"
+### Why use stable Problem Details errors?
 
-Name evidence by layer, then its limitation:
+- Clients need machine-readable failure categories without parsing prose.
+- RFC-style media type and fields are conventional; a stable `code` expresses
+  HookRelay-specific meaning.
+- Validation pointers identify the field while omitting submitted values.
+- Authentication and cross-tenant errors deliberately avoid details that could
+  become enumeration or secret oracles.
 
-- exact in-process HTTP contract tests;
-- controlled injected failure for sanitization and isolation;
-- a real PostgreSQL integration test and controlled Compose outage/recovery;
-- Alembic connection/upgrade validation;
-- clean Docker build and Compose observation;
-- CI on a standard Ubuntu runner.
+### Why create a delivery-attempt table before attempts exist?
 
-Avoid saying "all tests passed, therefore it scales." Scale claims require the
-Stage 7 methodology and recorded measurements.
+- It records the intended separation between a logical delivery and each
+  future execution try, avoiding a later overloaded mutable row.
+- The schema establishes constraints and audit vocabulary that Stage 3/4 can
+  use.
+- It does not justify claiming attempts exist: Stage 2 creates zero rows and no
+  delivery leaves `pending`.
 
-### "What would you improve next?"
+### What failure causes the whole ingestion transaction to roll back?
 
-At the end of Stage 1, the correct answer is Stage 2's durable ingestion model:
-tenants, endpoints, authenticated submission, idempotency, event/delivery state,
-and a transactional outbox in one PostgreSQL transaction. NATS and delivery
-workers wait for Stage 3 so the durability boundary is understood first.
+- Any database failure while inserting the event, a delivery, or an outbox row
+  invalidates the acceptance invariant.
+- The route rolls the request session back and returns sanitized `503`.
+- The producer can retry with the same idempotency key because no `201` was
+  promised before commit.
+- Targeted rollback tests should force failure inside the transaction and prove
+  every table count remains unchanged.
+
+## Security and limitation questions
+
+### Does requiring `HttpUrl` or HTTPS solve SSRF?
+
+- No. Syntax validation rejects malformed/userinfo/fragment forms, and
+  staging/production require an HTTPS scheme.
+- Complete SSRF defense must handle loopback/private/link-local/metadata IPs,
+  DNS resolution and rebinding, redirects, IPv6, and network egress policy.
+- Stage 2 performs no outbound request, so it stores risk but does not exercise
+  it. A worker must not be enabled against untrusted URLs until those defenses
+  are in place.
+
+### Is producer traffic protected by TLS?
+
+- Not by the application itself. Uvicorn/Compose serve HTTP and local Compose
+  binds only to loopback.
+- A deployed environment needs TLS termination at a trusted ingress/proxy and a
+  protected hop to the app.
+- Requiring `https://` for destination URLs protects neither API keys nor event
+  payloads on the producer-to-HookRelay connection.
+
+### Is request size bounded?
+
+- Individual names, types, URLs, endpoint count, key grammar, and top-level body
+  shapes are bounded.
+- There is no explicit whole-request byte cap or tenant payload/storage quota in
+  Stage 2.
+- A production design needs ingress and application limits, rate limits, and
+  clear `413`/quota contracts before accepting hostile traffic.
+
+### Does encryption at rest make secret storage complete?
+
+- No. It reduces exposure if the database alone is copied.
+- The key must be stored separately with access control, rotation, audit,
+  backup, restore, and incident-recovery procedures.
+- The checked-in local key is intentionally not a production key, and settings
+  reject it in staging/production.
+- Memory, logs, client handling, and authorized application access remain part
+  of the threat model.
+
+## Test-evidence questions
+
+### How do you know Stage 2 works?
+
+Name evidence by boundary:
+
+- Unit tests: configuration, canonical fingerprints, key parsing/digest checks,
+  and authenticated-encryption behavior.
+- In-process API tests: exact `201`/header/body contracts, problem media type,
+  content type, validation, credential rejection, and secret redaction.
+- Real PostgreSQL integration tests: migration, composite constraints,
+  transaction rollback, endpoint/event persistence, same-request replay,
+  different-request conflict, tenant isolation, and concurrent duplicates.
+- Alembic checks: revision application and model/schema alignment.
+- Compose/Docker checks: local topology and packaged Linux artifact.
+
+Then state the limit: even all of them together do not prove production load,
+long-lived reliability, hostile-input resilience, TLS/proxy correctness, SSRF
+defense, broker behavior, or receiver compatibility.
+
+### Why not use SQLite for the integration suite?
+
+- It would bypass exactly the PostgreSQL behaviors under test: JSONB, partial
+  indexes, regex/check constraints, `ON CONFLICT`, transaction visibility, and
+  concurrent uniqueness.
+- Fast substitute tests can complement the suite but cannot be the evidence for
+  a PostgreSQL-specific correctness claim.
+
+### What is a valuable safe failure demonstration?
+
+- Submit many concurrent requests with the same tenant, key, and body.
+- Observe one event, one delivery per endpoint, one outbox per delivery, zero
+  attempts, stable IDs, and replay responses.
+- Then reuse the same key with a changed payload and observe `409` with unchanged
+  row counts.
+- This tests an intended correctness boundary without exposing a secret,
+  deleting a volume, or sending traffic to a real third party.
+
+## Recruiter-oriented story prompts
+
+### “What was the most important design decision?”
+
+Use the transaction/outbox invariant:
+
+- State the dual-write failure window.
+- Draw event + deliveries + outbox inside one PostgreSQL commit.
+- Explain why NATS is intentionally outside Stage 2.
+- Admit duplicate publication remains possible later.
+- Point to rollback/integration evidence rather than saying “transactions are
+  reliable.”
+
+An equally strong alternative is database-enforced idempotency: explain why a
+process-local precheck loses under concurrency and how the unique constraint
+elects one winner.
+
+### “Tell me about a security tradeoff.”
+
+Contrast credential storage:
+
+- hash API-key secrets because they need verification only;
+- encrypt signing secrets because later HMAC generation needs recovery;
+- bind AES-GCM ciphertext to row context with AAD;
+- return both raw values only once;
+- identify key management and TLS as remaining operational dependencies.
+
+### “Tell me about a failure you tested.”
+
+Use one concrete loop:
+
+- **Concurrency:** many same-key requests converge to one durable event.
+- **Conflict:** changed input under the same key becomes a stable `409` without
+  new rows.
+- **Rollback:** injected outbox failure leaves no event or delivery residue.
+- **Dependency outage:** readiness becomes `503` while liveness remains `200`
+  and later recovers.
+
+For each, say what was observed and one thing the exercise cannot prove.
+
+### “What would you build next?”
+
+Stage 3 should publish durable outbox rows to NATS JetStream and add a
+bounded-concurrency worker that signs and sends webhook requests. Before that
+worker is exposed to untrusted endpoint URLs, add or deliberately gate SSRF
+defenses. Preserve idempotent message consumption because publish/mark and
+HTTP acknowledgment still have crash ambiguity. Do not jump directly to retry
+polish while the handoff boundary is unverified.
 
 ## Claims to avoid
 
-- "Async code is parallel."
-- "Containers are lightweight VMs, one VM per container."
-- "The `.env` file makes secrets secure."
-- "Compose handles database outages for us."
-- "SQLAlchemy automatically migrates production schemas."
-- "Unit tests prove the PostgreSQL integration."
-- "At least once means the receiver's side effect happens exactly once."
-- "The system is production scale" before Stage 7 measurements exist.
-- "HookRelay delivers webhooks" while reviewing only Stage 1.
+- “A `201` means the webhook was delivered.”
+- “Stage 2 uses NATS.”
+- “Stage 2 creates delivery attempts.”
+- “The transactional outbox gives exactly-once publishing.”
+- “An application precheck makes idempotency concurrency-safe.”
+- “JSON key order makes these two requests different.”
+- “SHA-256 is how every password should be stored.”
+- “Encryption means the application cannot reveal the secret.”
+- “HTTPS URL validation solves SSRF.”
+- “Destination HTTPS protects producer API keys.”
+- “Pydantic validation imposes a request byte limit.”
+- “A global SQLAlchemy session saves connections safely.”
+- “Changing the ORM model migrates PostgreSQL.”
+- “Async code is parallel.”
+- “All tests passed, therefore the system is production scale.”
+- “At least once means the receiver's side effect occurs exactly once.”
 
-## Three-to-five-minute Stage 1 teach-back
+## Three-to-five-minute Stage 2 teach-back
 
 Aim for this timing:
 
-1. **0:00-0:30 — Goal and boundary:** Describe the product, then state exactly
-   what Stage 1 does and does not implement.
-2. **0:30-1:20 — Request trace:** Contrast liveness's process-local path with
-   readiness's bounded SQLAlchemy/asyncpg/PostgreSQL path.
-3. **1:20-2:10 — Lifecycle:** Explain application factory, lifespan, one
-   engine/pool, short future sessions, and shutdown disposal.
-4. **2:10-3:00 — Deployment:** Distinguish Dockerfile/image/container; trace
-   `127.0.0.1` host publishing, Compose DNS `postgres`, health checks, and the
-   named volume.
-5. **3:00-4:00 — Evidence:** Name each test layer and one thing it cannot prove.
-6. **4:00-5:00 — Decisions:** Defend Python, PostgreSQL, explicit migrations,
-   and the future at-least-once guarantee against their serious alternatives.
+1. **0:00-0:30 — Boundary:** Product goal, durable-ingestion outcome, and the
+   explicit absence of NATS/outbound attempts.
+2. **0:30-1:10 — Identity:** Bootstrap, one-time API key, bearer verification,
+   derived tenant scope, and composite database enforcement.
+3. **1:10-1:50 — Secrets:** One-time signing secret, hashing versus AES-GCM,
+   associated data, and key-management limit.
+4. **1:50-2:50 — Transaction:** Trace event validation through event + delivery
+   snapshots + outbox and commit-before-`201`.
+5. **2:50-3:40 — Idempotency:** Canonical fingerprint, database race, `201`
+   replay/header, and exact `409` conflict semantics.
+6. **3:40-4:30 — Evidence:** Name the unit/API/PostgreSQL/concurrency/rollback
+   tests and one limit of each layer.
+7. **4:30-5:00 — Risks/next step:** Request-size, TLS, SSRF, quotas, and why the
+   future pipeline remains at least once.
 
-If any part cannot be explained without reading the code aloud, return to the
-relevant file and trace one concrete request by hand.
+If any sentence depends on “FastAPI handles it” or “the database guarantees it”
+without naming the route, transaction, constraint, or test, trace one concrete
+request again before using the answer in an interview.
