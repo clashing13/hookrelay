@@ -27,6 +27,8 @@ dependencies = [
 [project.scripts]
 hookrelay = "hookrelay.main:run"
 hookrelay-outbox = "hookrelay.outbox:run"
+hookrelay-worker = "hookrelay.worker:run"
+hookrelay-test-receiver = "hookrelay.test_receiver:run"
 
 [dependency-groups]
 dev = [
