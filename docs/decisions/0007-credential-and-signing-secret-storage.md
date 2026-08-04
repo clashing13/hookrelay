@@ -9,7 +9,7 @@ Stage 2 introduces three secret roles with different lifecycles:
 
 1. a deployment bootstrap token authorizes creation of an initial tenant;
 2. tenant API keys authenticate inbound producer requests;
-3. endpoint signing secrets will let a future worker authenticate outbound
+3. endpoint signing secrets will let a delivery worker authenticate outbound
    webhook requests to receivers.
 
 Persisting every raw value in plaintext would turn any database read or backup
@@ -61,6 +61,11 @@ Keep signing-secret versions separate from endpoints. Permit one active
 non-retired version per endpoint, and make accepted deliveries reference the
 specific version they snapshot.
 
+Stage 3 uses this decision: the worker loads the secret row referenced by the
+delivery snapshot, verifies the tenant/endpoint relationship, decrypts with the
+same versioned AAD, and computes the versioned exact-byte webhook HMAC. It does
+not put plaintext into NATS, attempts, receiver capture, or logs.
+
 Reject the documented development encryption key in staging and production.
 This configuration safeguard does not replace managed key storage.
 
@@ -74,7 +79,7 @@ for the current design.
 
 ### Hash every secret
 
-This is correct for inbound API-key verification but would make a future HMAC
+This is correct for inbound API-key verification but would make the HMAC
 signing secret unrecoverable. The worker could not compute the value the
 receiver expects.
 
@@ -117,7 +122,7 @@ contract.
 - Losing an encryption key makes corresponding signing-secret ciphertext
   unrecoverable; backups and disaster recovery must preserve keys separately
   and securely.
-- Key version fields make rotation representable, but Stage 2 does not provide
+- Key version fields make rotation representable, but Stage 3 does not provide
   re-encryption, endpoint secret rotation, API-key creation/revocation, or
   bootstrap lifecycle APIs.
 - No-store headers reduce caching but cannot control screenshots, client logs,

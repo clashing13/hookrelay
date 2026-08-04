@@ -42,6 +42,31 @@ creation rolls back all of it.
 Stage 2 deliberately stops there. It does not publish the outbox, connect to
 NATS, send an HTTP request, update `published_at`, or create a delivery attempt.
 
+## Stage 3 implementation
+
+Migration `20260803_0002` adds an expiring claim token and expiry to each
+outbox row. Publishers select a bounded ordered batch of eligible rows with
+`FOR UPDATE SKIP LOCKED`, validate the persisted ID-only contract, write the
+claim, and commit before NATS I/O. This avoids holding a database lock and
+connection while an independent broker responds.
+
+The publisher sends the outbox UUID as `Nats-Msg-Id`, waits for a JetStream
+PubAck from the expected stream, and conditionally sets `published_at` only
+while its claim token still matches. A handled failure releases remaining
+owned claims; a process crash leaves them to expire.
+
+This implementation closes no cross-system atomicity gap: if JetStream stores
+the message but PubAck/finalization is lost, the same row can publish again.
+Finite-window broker deduplication reduces quick duplicates but does not change
+the at-least-once guarantee.
+
+The claim TTL must be strictly greater than
+`outbox_batch_size * nats_publish_timeout_seconds`, the maximum aggregate
+configured broker-publish wait budget. Database finalization and loop overhead
+are additional, so deployments should preserve operating margin. Cooperative
+shutdown checks between items and releases the unprocessed remainder; a hard
+crash still relies on TTL expiry.
+
 ## Serious alternatives
 
 ### Publish after committing the event
@@ -78,7 +103,7 @@ has its own identity.
 An event can target many endpoints whose execution, retry, and terminal state
 are independent. Per-event messages would require another fan-out step and make
 per-destination scheduling less direct. One message per delivery matches the
-future worker's unit of work.
+  delivery worker's unit of work.
 
 ## Consequences
 
@@ -91,10 +116,12 @@ future worker's unit of work.
   monitoring later.
 - Publication will still be at least once. A publisher can succeed at NATS and
   crash before recording `published_at`, causing a duplicate publish on retry.
+- Claim leases keep NATS latency outside the database transaction but introduce
+  TTL-delayed recovery after a hard publisher crash.
 - Consumers must be idempotent by stable message/delivery identity.
 - The outbox does not guarantee global ordering across tenants or destinations;
   any ordering contract must be designed and tested explicitly.
 - ID-only messages reduce broker data exposure but require the worker to load
   authoritative state from PostgreSQL.
-- No Stage 2 response may imply that an unpublished row was attempted or
-  delivered.
+- No event-creation response may imply that an unpublished row was attempted or
+  delivered; current state is observed separately.
