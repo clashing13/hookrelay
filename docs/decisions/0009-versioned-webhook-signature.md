@@ -45,7 +45,7 @@ signature = "v1=" + lowercase_hex(HMAC-SHA256(endpoint_secret, signed_content))
 Send:
 
 - `Content-Type: application/json`;
-- `User-Agent: HookRelay/0.3.0`;
+- `User-Agent: HookRelay/<service version>`;
 - `HookRelay-Delivery-Id`;
 - `HookRelay-Event-Id`;
 - `HookRelay-Signature`;
@@ -105,4 +105,7 @@ so HMAC is the narrower Stage 3 choice.
   version rather than silently changing version 1.
 - Diagnostic headers added later are not authenticated unless the signed
   grammar explicitly includes them. They must not be trusted for authorization.
+- Stage 4 changes retry/dispatch state but preserves webhook body and signature
+  version 1. Dispatch generation remains internal PostgreSQL metadata and is not
+  silently added to the signed body.
 - Secret rotation and overlapping verification windows remain Stage 5 work.

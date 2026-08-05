@@ -1,6 +1,6 @@
 # ADR 0004: At-least-once delivery instead of exactly-once claims
 
-- Status: Accepted; happy-path execution implemented in Stage 3
+- Status: Accepted; bounded failure recovery implemented in Stage 4
 - Date: 2026-08-01
 
 ## Context
@@ -39,10 +39,12 @@ succeeded delivery, but it cannot suppress the case where a receiver performs
 its side effect and HookRelay fails before recording success. The stable event
 ID remains the receiver's idempotency key.
 
-Stage 3 does not yet implement a complete retry guarantee. A failed attempt is
-recorded and the broker message remains unacknowledged for `AckWait` redelivery,
-but persistent scheduling, backoff, jitter, maximum attempts, worker-crash
-recovery, dead letters, and replay arrive in Stage 4.
+Stage 4 adds PostgreSQL-authoritative due times, capped exponential backoff with
+jitter, generation-scoped maximum attempts, leased worker-crash recovery,
+dead-letter state, and authenticated replay. The worker persists a retry or
+terminal decision before delayed NAK or ACK. An expired attempt is abandoned
+because its receiver outcome is unknown; recovery may therefore send the stable
+event again.
 
 ## Serious alternatives
 
@@ -68,10 +70,10 @@ than solve it.
 - Delivery attempts and logical events must be modeled separately.
 - Metrics must distinguish events, attempts, successful acknowledgments, and
   duplicate observations.
-- The transactional outbox and Stage 3 broker/worker reduce different
+- The transactional outbox and Stage 3/4 broker/worker reduce different
   loss windows, but neither removes broker acknowledgment or HTTP
   acknowledgment ambiguity.
 - A succeeded database state can suppress a repeated HTTP call after a lost
   broker ACK; it cannot make an unknown receiver side effect exactly once.
-- Tests and documentation must distinguish the happy path from the Stage 4
-  recovery guarantee and Stage 7 scale evidence.
+- Tests and documentation must distinguish the implemented recovery schedules
+  from exhaustive process-kill proof and Stage 7 scale evidence.

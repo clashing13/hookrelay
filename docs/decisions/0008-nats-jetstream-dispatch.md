@@ -36,7 +36,7 @@ Create or validate one shared durable pull consumer:
 - deliver-all and instant replay;
 - explicit acknowledgments;
 - bounded `MaxAckPending`;
-- unlimited Stage 3 `MaxDeliver`.
+- unlimited `MaxDeliver`.
 
 Publish the existing strict ID-only outbox envelope. Set `Nats-Msg-Id` to the
 outbox UUID and wait for a PubAck from the expected stream before conditionally
@@ -46,6 +46,16 @@ Workers fetch no more than one local concurrency window and acknowledge with
 `ack_sync` only after PostgreSQL commits successful attempt and delivery state.
 Publisher and worker connections drain on cooperative shutdown with a bounded
 default drain timeout of five seconds.
+
+Stage 4 retains the same strict schema-v1 ID-only broker envelope. Dispatch
+generation is stored on the authoritative outbox row and derived only after
+`message_id` reconciliation. The worker uses delayed NAK for a persisted retry
+due time or active claim lease, and ACKs after success, dead letter, or stale-
+generation decisions.
+
+`MaxDeliver` remains unlimited because broker delivery count includes due-time
+and lease deferrals that create no HTTP attempt. PostgreSQL counts actual or
+ambiguous attempts within a dispatch generation and owns the business maximum.
 
 ## Serious alternatives
 
@@ -96,7 +106,8 @@ stream, consumer cursor, or PubAck semantics.
 - `Nats-Msg-Id` can reduce duplicate publication only inside its finite window.
 - A PubAck and PostgreSQL finalization are not one transaction; duplicate
   publication remains possible.
-- `AckWait` redelivery is not the Stage 4 retry policy.
+- `AckWait` is a recovery wake-up, not the Stage 4 retry schedule. PostgreSQL
+  stores the exact due time and delayed NAK requests a later presentation.
 - Local single-server, single-replica file storage is reproducible persistence,
   not HA, quorum durability, backup, or a production deployment recommendation.
 - Stage 7 measurements may justify revisiting broker/topology decisions.

@@ -4,18 +4,16 @@ This guide turns the implemented system into precise interview explanations.
 Lead with an invariant and evidence, then state the boundary. Avoid reciting a
 tool list or claiming roadmap behavior as complete.
 
-## Thirty-second Stage 3 pitch
+## Thirty-second Stage 4 pitch
 
-> HookRelay `0.3.0` accepts authenticated events idempotently, commits each
-> event and its dispatch intent atomically in PostgreSQL, and asynchronously
-> sends a signed webhook through a transactional-outbox publisher, NATS
-> JetStream, and a bounded Python worker. The publisher uses expiring database
-> claims and marks rows only after a JetStream PubAck. The worker loads
-> authoritative state, records an attempt, signs exact JSON bytes with a
-> timestamped HMAC, commits success, and only then ACKs the durable message. The
-> guarantee remains at least once; Stage 4 adds designed retry/crash recovery,
-> and Stage 5 replaces the current local-only outbound gate with full SSRF
-> controls.
+> HookRelay `0.4.0` accepts events idempotently and commits dispatch intent in
+> PostgreSQL before an outbox publisher sends an ID-only command through NATS
+> JetStream to a bounded signed-webhook worker. PostgreSQL owns retry due time,
+> exponential backoff with jitter, a five-attempt generation budget, expiring
+> worker claims, and terminal dead-letter reasons. The worker persists a retry
+> or terminal decision before delayed NAK or ACK. An authenticated replay creates
+> a fresh outbox UUID and generation without erasing attempts. It remains at
+> least once; Stage 5 still owns full SSRF, rate, and circuit controls.
 
 ## Ninety-second architecture answer
 
@@ -34,19 +32,25 @@ tool list or claiming roadmap behavior as complete.
    canonical versioned request and uses a tenant/key unique constraint plus
    PostgreSQL `ON CONFLICT` to make retries safe across concurrent API replicas.
 6. The successful transaction creates one event, one pending delivery per
-   endpoint, and one unpublished outbox row per delivery. Only after commit does
-   the route return `201`.
+   endpoint, and one generation-1 outbox row per delivery. Only after commit
+   does the route return `201`.
 7. A separate publisher leases eligible outbox rows in short PostgreSQL
    transactions, publishes ID-only commands to a file-backed JetStream stream,
    waits for PubAck, then conditionally records `published_at`.
 8. Workers share a durable pull consumer and bound concurrency with a fetch
    window, semaphore, HTTP pool, and broker `MaxAckPending`.
-9. A worker reconciles broker IDs with PostgreSQL, commits an unfinished attempt,
-   signs deterministic bytes as `v1=HMAC-SHA256(secret, timestamp.body)`, sends
-   timeout-bounded HTTP, commits success, and then calls `ack_sync`.
-10. The local receiver captures exact bytes and headers for verification. The
-    transport is at least once; Stage 4 owns recovery policy and Stage 5 owns
-    complete outbound security.
+9. A worker reconciles the broker message with its exact PostgreSQL outbox row,
+   derives dispatch generation there, and claims an attempt with a token and
+   database-time expiry before timeout-bounded HTTP.
+10. Success commits before ACK. Transient failure commits a capped
+    exponential/jittered due time before delayed NAK; permanent, exhausted, or
+    policy-blocked work commits a dead letter before ACK.
+11. An expired worker claim becomes an abandoned attempt and is scheduled or
+    dead-lettered. Token/generation/expiry checks fence late finalizers.
+12. Authenticated manual replay increments generation and creates a fresh
+    outbox UUID in one transaction. The unchanged schema-v1 broker envelope
+    remains ID-only; old-generation fencing comes from the reconciled outbox
+    row. The guarantee remains at least once.
 
 ## Whiteboard trace
 
@@ -66,10 +70,15 @@ Producer
   -> 201 Created
   -> outbox lease -> JetStream PubAck -> published_at
   -> durable pull consumer -> bounded worker
-  -> attempt + delivering commit
+  -> attempt + delivering claim/lease commit
   -> timestamped exact-byte HMAC HTTP
-  -> succeeded attempt + delivery commit
-  -> JetStream ack_sync
+       -> 2xx -> success commit -> ACK
+       -> transient -> retry_scheduled + due time commit -> delayed NAK
+       -> permanent/exhausted -> dead_lettered + reason commit -> ACK
+  -> expired attempt lease -> abandoned -> retry/dead letter
+
+Operator -> POST /v1/deliveries/{id}/replay
+         -> generation + 1 + fresh outbox UUID, one transaction -> 202
 
 Ambiguity: PubAck before outbox finalization; receiver action before
 HookRelay success certainty. Stable IDs + idempotency, not exactly once.
@@ -361,37 +370,120 @@ HookRelay success certainty. Stable IDs + idempotency, not exactly once.
 - Commit-before-ACK can redeliver, but `succeeded` lets the worker skip a second
   HTTP request and ACK safely.
 
-### What happens on failure today?
+### What failure boundary did Stage 3 intentionally leave?
 
-- Timeout, transport error, or non-2xx becomes a `transient_failure`; delivery
-  returns to `pending`; the NATS message remains unacknowledged.
-- `AckWait` can expose it again, but there is no persistent schedule, backoff,
-  jitter, classification, maximum, or dead letter yet.
-- A crash after the unfinished-attempt commit can leave delivery `delivering`;
-  Stage 3 reports progress rather than duplicating HTTP, but cannot recover the
-  stale attempt.
-- Stage 4 owns both designed retry and crash recovery.
+- Timeout, transport error, or non-2xx recorded a transient attempt and relied
+  on raw `AckWait` redelivery.
+- It had no persistent due time, backoff/jitter, classification, maximum, or
+  terminal transition.
+- A crash after attempt commit could leave `delivering` indefinitely.
+- Stage 4 replaces that historical boundary; do not describe the Stage 3
+  behavior as current `0.4.0` behavior.
 
-### Which messages terminate and which stay recoverable?
+## Stage 4 failure-recovery questions
 
-- Malformed internal envelopes and identities that contradict authoritative
-  PostgreSQL state are poison; the worker terminates them rather than performing
-  HTTP.
-- A valid delivery blocked by the temporary local/test hostname policy is not
-  poison. It remains unacknowledged so a later reviewed policy/configuration can
-  recover it.
-- Stage 4 will add dead-letter and operator recovery semantics.
+### Why is PostgreSQL authoritative for retry timing?
+
+- Attempt outcome, status, and exact due time commit atomically.
+- The schedule survives worker restart or a lost NAK.
+- Every redelivery locks and rechecks due state; an early wake-up cannot execute.
+- JetStream remains the durable transport and delayed wake-up, not a second
+  domain database.
+
+### What is the exact retry formula?
+
+- For current-generation attempt `n`, calculate
+  `min(max, base * 2^(n-1))`.
+- Draw uniformly between `(1-ratio) * ceiling` and `ceiling`, with a 100 ms
+  floor.
+- Defaults are base 1 second, cap 60 seconds, and 25% downward jitter.
+- Injecting the random source makes edge tests deterministic.
+
+### Why is `MaxDeliver=-1` while max attempts is five?
+
+- JetStream counts every presentation: early due-time wake-up, active-lease
+  deferral, lost ACK, and actual attempt.
+- PostgreSQL counts only actual or ambiguous abandoned attempts in the current
+  dispatch generation.
+- A broker limit of five could exhaust work without five HTTP attempts.
+
+### How are receiver outcomes classified?
+
+- `2xx` succeeds.
+- Timeout, async transport error, `408`, `425`, `429`, and `5xx` are transient.
+- Other HTTP statuses are permanent and dead-letter immediately.
+- This is explicit global policy, not a claim that every customer API uses the
+  same semantics.
+
+### How does attempt-lease recovery work?
+
+- Attempt and delivery share a random claim token; the delivery stores an
+  expiry from PostgreSQL `clock_timestamp()`.
+- Claim TTL must exceed HTTP timeout plus the explicit finalization margin so a
+  healthy response has time for its second transaction.
+- Before expiry, redelivery receives a delayed NAK rather than another request.
+- After expiry, the old attempt becomes `abandoned` with
+  `worker_lease_expired` and spends generation budget.
+- Exact attempt/generation/token/state/expiry checks fence a late finalizer.
+- The fence protects HookRelay state, not a remote side effect already made.
+
+### What exactly is dead-lettered?
+
+- The existing delivery enters a terminal PostgreSQL state.
+- It records `dead_lettered_at` and reason `permanent_failure`,
+  `attempts_exhausted`, or `target_blocked`.
+- Its broker message is ACKed after that transaction commits.
+- There is no separate dead-letter stream/queue in Stage 4.
+
+### How does manual replay work?
+
+- `POST /v1/deliveries/{id}/replay` requires the tenant API key, JSON content
+  type, body `{"expected_dispatch_generation": N}`, and current
+  `dead_lettered` state.
+- Under a row lock, it increments database dispatch generation, clears terminal
+  state, sets `pending`, and inserts a fresh outbox UUID in one transaction.
+- It returns `202` plus the event `Location`; publication/delivery is not
+  implied.
+- Missing/cross-tenant IDs share opaque `404`; a stale expected generation is
+  `409 delivery_generation_conflict`; another state is
+  `409 delivery_not_replayable`.
+- Lifetime attempt history remains; the generation receives a fresh bounded
+  budget.
+
+### Why does the broker envelope stay schema v1?
+
+- Generation is authoritative on the exact outbox row found by `message_id`,
+  not duplicated into the broker payload.
+- Keeping the strict seven-field envelope avoids old Stage 3 workers TERMing a
+  replay message as unknown schema/data.
+- Current workers derive generation after complete outbox reconciliation and
+  ACK messages from an older row generation as stale.
+- During deployment, finish worker cutover before manual replay: an old worker
+  can parse the compatible envelope but lacks generation fencing and may send an
+  extra stale request.
+
+### Which messages terminate, ACK, or remain recoverable?
+
+- Malformed or authoritative-state-contradictory commands TERM as poison.
+- Success, already-success, dead-letter, and stale generation ACK after durable
+  state.
+- Scheduled retry and active lease use delayed NAK.
+- A blocked target normally commits `target_blocked` and ACKs; a fixed delayed
+  NAK is only the pre-persistence fallback.
+- A stale worker that loses its claim performs no broker action from its old
+  handle.
 
 ## Security and limitation questions
 
-### Does requiring `HttpUrl`, HTTPS, or the Stage 3 allowlist solve SSRF?
+### Does requiring `HttpUrl`, HTTPS, or the local/test allowlist solve SSRF?
 
 - No. Schema validation accepts only HTTP(S) syntax and rejects
   userinfo/fragments. The endpoint API additionally requires HTTPS in
-  staging/production, while Stage 3 delivery workers refuse to run there at
+  staging/production, while delivery workers refuse to run there at
   all.
-- Stage 3 restricts workers to local/test, requires an explicit hostname
-  allowlist, disables redirects, and ignores environment proxies.
+- The current worker restricts execution to local/test, requires an explicit
+  hostname allowlist, disables redirects, and ignores environment proxies. A
+  blocked target becomes replayable terminal `target_blocked` state.
 - Complete SSRF defense must still handle loopback/private/link-local/metadata
   IPs, DNS resolution/rebinding, IPv6, and network egress policy.
 - The current gate permits a controlled local receiver; it is not safe
@@ -410,8 +502,8 @@ HookRelay success certainty. Stable IDs + idempotency, not exactly once.
 
 - Individual names, types, URLs, endpoint count, key grammar, and top-level body
   shapes are bounded.
-- There is no explicit whole-request byte cap or tenant payload/storage quota in
-  Stage 2.
+- There is no explicit whole-request byte cap or tenant payload/storage quota
+  through Stage 4.
 - A production design needs ingress and application limits, rate limits, and
   clear `413`/quota contracts before accepting hostile traffic.
 
@@ -427,6 +519,33 @@ HookRelay success certainty. Stable IDs + idempotency, not exactly once.
 
 ## Test-evidence questions
 
+### How do you know Stage 4 works?
+
+Name evidence by boundary:
+
+- Pure policy tests: exact exponential/jitter edges, status classification,
+  strict unchanged schema-v1 envelope, settings, and ACK/NAK dispositions.
+- PostgreSQL integration: schedule/due constraints, attempt claims, expired
+  abandonment, stale-token fencing, fresh database time after a row-lock wait,
+  generation-specific counting, and terminal reasons.
+- Real service paths: transient failure can schedule and later succeed;
+  permanent and exhausted work dead-letter; success state suppresses lost-ACK
+  duplicate HTTP.
+- Replay API/database: tenant isolation, expected-generation precondition,
+  concurrency, new outbox UUID/generation, preserved history, and stale-row
+  suppression.
+- Process recovery: a separate worker is forcibly killed after receiver
+  capture; a replacement abandons the expired claim, retries, and produces a
+  second identical capture for that encoded schedule.
+- Migrations/packaging: upgrade/backfill, guarded downgrade, `alembic check`,
+  Compose validation, and Linux image build.
+
+The Stage 4 integration file contributes twelve recovery scenarios, and the
+complete checkpoint suite passed all 143 tests. Then state the limit: a real
+subprocess kill is stronger than fixture-driven expiry, but one schedule still
+does not prove every crash point, receiver exactly once, HA, hostile-network
+safety, or production capacity.
+
 ### How do you know Stage 3 works?
 
 Name evidence by boundary:
@@ -441,9 +560,9 @@ Name evidence by boundary:
 - Migrations/packaging: upgrade/downgrade/re-upgrade, `alembic check`, Compose
   validation, and Linux image build.
 
-Then state the limit: this does not prove every crash schedule, exactly once,
-Stage 4 retry/recovery, Stage 5 hostile-network safety, clustered HA, or
-production throughput.
+Then state its historical limit: Stage 3 evidence did not prove the Stage 4
+retry/recovery policy, exactly once, Stage 5 hostile-network safety, clustered
+HA, or production throughput.
 
 ### How do you know Stage 2 works?
 
@@ -473,13 +592,15 @@ defense, broker behavior, or receiver compatibility.
 
 ### What is a valuable safe failure demonstration?
 
-- Submit many concurrent requests with the same tenant, key, and body.
-- Observe one event, one delivery per endpoint, one outbox per delivery, zero
-  attempts, stable IDs, and replay responses.
-- Then reuse the same key with a changed payload and observe `409` with unchanged
-  row counts.
-- This tests an intended correctness boundary without exposing a secret,
-  deleting a volume, or sending traffic to a real third party.
+- Configure only the local receiver to return `503` and observe a transient
+  attempt plus a persistent due time before delayed NAK.
+- Restore `204` and observe later success without creating unbounded work.
+- Separately use `400` to show an immediate permanent dead letter, then replay
+  with the observed expected generation after repairing the receiver.
+- For crash ambiguity, delay the local receiver, save its first capture, kill
+  the disposable worker, and observe abandoned-attempt recovery after the
+  database lease expires.
+- Never delete named volumes or send the exercise to a real third party.
 
 ## Recruiter-oriented story prompts
 
@@ -522,17 +643,30 @@ Use one concrete loop:
   after restart the publisher drains it and the local receiver gets the event.
 - **Ambiguous ACK:** a duplicated broker message observes `succeeded`, skips a
   second HTTP call, and ACKs from durable database state.
+- **Transient destination:** `503` commits an attempt and database due time,
+  then later succeeds after destination recovery.
+- **Expired worker lease:** an unfinished attempt becomes `abandoned`, spends
+  budget, and a stale token cannot finalize over the recovered owner.
+- **Permanent/exhausted work:** a durable dead-letter reason commits before
+  broker ACK.
+- **Policy block:** `target_blocked` commits without an HTTP attempt, then ACKs;
+  replay is available after a reviewed allowlist fix.
+- **Replay:** expected generation, tenant scope, and row locking produce one
+  fresh outbox UUID without erasing earlier attempts.
+- **Real process death:** kill a separate worker after receiver capture, then
+  observe expired-claim abandonment and replacement-worker recovery with the
+  same body.
 
 For each, say what was observed and one thing the exercise cannot prove.
 
 ### “What would you build next?”
 
-Stage 4 should replace raw `AckWait` redelivery with persistent retry state,
-classification, exponential backoff and jitter, maximum attempts, stale-attempt
-worker-crash recovery, dead letters, and replay. It must test killed workers and
-unavailable destinations. Stage 5 then replaces the current local/test
-hostname gate with complete DNS/IP/rebinding/egress SSRF controls plus rate and
-circuit protection.
+Stage 5 should replace the local/test hostname gate with complete
+DNS/IP/rebinding/egress SSRF controls, add per-endpoint rate limiting and
+circuit breaking, define size limits, and design secret rotation. Stage 6 then
+adds telemetry, history APIs, and the operations console. Stage 7 should expand
+the single Stage 4 subprocess-kill schedule into a broader fault matrix and add
+load, soak, HA, and capacity evidence.
 
 ## Claims to avoid
 
@@ -556,32 +690,42 @@ circuit protection.
 - “A PubAck and database update are one transaction.”
 - “File-backed single-node JetStream is highly available.”
 - “`AckWait` is our complete retry policy.”
-- “An unfinished Stage 3 attempt always recovers after worker death.”
+- “JetStream `MaxDeliver` is our HTTP attempt count.”
+- “Every broker redelivery spends retry budget.”
+- “Jitter means retry can exceed the cap.”
+- “Every `4xx` is transient.”
+- “A lease proves the receiver did not process the old request.”
+- “Fencing makes worker-crash recovery exactly once.”
+- “Dead letter means a separate queue.”
+- “Manual replay erases failed attempts.”
+- “`202` replay means the receiver got the webhook.”
+- “Dispatch generation is carried in the broker payload.”
+- “Keeping broker schema v1 makes mixed old/new workers fully safe for replay.”
+- “A fixture with an expired lease proves OS-level worker-kill recovery.”
 - “The hostname allowlist is complete SSRF protection.”
 - “HMAC encrypts the webhook body.”
 - “A timestamp alone prevents replay.”
 - “Async means the worker has unlimited concurrency.”
 - “The happy-path test proves production scale.”
 
-## Three-to-five-minute Stage 3 teach-back
+## Three-to-five-minute Stage 4 teach-back
 
 Aim for this timing:
 
-1. **0:00-0:30 — Boundary:** PostgreSQL `201` acceptance versus asynchronous
-   receiver success and the at-least-once guarantee.
-2. **0:30-1:15 — Publisher:** expiring claim, `SKIP LOCKED`, ID-only message,
-   PubAck, conditional `published_at`, and duplicate window.
-3. **1:15-2:00 — JetStream/backpressure:** file-backed work queue, shared
-   durable pull cursor, explicit ACK, fetch/semaphore/pool/`MaxAckPending`.
-4. **2:00-3:00 — Worker/wire:** authoritative database reconciliation,
-   attempt-before-HTTP, snapshotted secret, exact JSON, timestamped HMAC, and
-   timeout.
-5. **3:00-3:40 — Ordering/ambiguity:** success commit before `ack_sync`,
-   suppression after DB success, and receiver-success ambiguity.
-6. **3:40-4:25 — Evidence:** deterministic vector, real PostgreSQL, real NATS,
-   real HTTP, full happy path, and one limitation of each.
-7. **4:25-5:00 — Boundaries:** retry/crash recovery in Stage 4, full SSRF in
-   Stage 5, and no exactly-once/HA/scale claim.
+1. **0:00-0:35 — Boundary:** Stage 3 raw redelivery/stuck attempts versus Stage
+   4 persistent recovery; at least once remains.
+2. **0:35-1:15 — Policy:** exact classifier, five-attempt generation budget,
+   exponential ceiling, and bounded downward jitter.
+3. **1:15-2:00 — Scheduling:** failure plus due-time commit, delayed NAK,
+   early-wake recheck, and why broker `MaxDeliver` is unlimited.
+4. **2:00-2:50 — Crash:** token/expiry, abandonment, budget, and stale-finalizer
+   fencing; remote ambiguity remains.
+5. **2:50-3:35 — Terminal/replay:** three dead-letter reasons,
+   ACK-after-commit, expected-generation replay, and fresh outbox UUID.
+6. **3:35-4:20 — Compatibility:** unchanged ID-only schema v1, generation from
+   the reconciled outbox row, stale suppression, and worker-cutover caveat.
+7. **4:20-5:00 — Evidence/boundaries:** distinguish unit, database, real
+   service, and hard-process-kill evidence; Stage 5 security remains.
 
 If any sentence depends on “FastAPI handles it” or “the database guarantees it”
 without naming the route, transaction, constraint, or test, trace one concrete

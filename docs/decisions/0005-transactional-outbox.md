@@ -67,6 +67,25 @@ are additional, so deployments should preserve operating margin. Cooperative
 shutdown checks between items and releases the unprocessed remainder; a hard
 crash still relies on TTL expiry.
 
+## Stage 4 replay evolution
+
+Initial ingestion still creates exactly one outbox row per delivery. Manual
+dead-letter replay deliberately creates another dispatch fact, so migration
+`20260804_0003` changes uniqueness to
+`(delivery_id, topic, dispatch_generation)` and gives each row a positive
+database generation.
+
+Replay increments the delivery generation and inserts a fresh outbox UUID in
+the same PostgreSQL transaction. The broker payload remains the strict Stage 3
+schema-v1 seven-field ID envelope: generation is derived from the exact outbox
+row after its `message_id` is reconciled. A fresh UUID avoids reuse of an ACKed
+message and JetStream's finite `Nats-Msg-Id` duplicate window.
+
+The guarded downgrade refuses to collapse multiple replay-generation rows into
+the Stage 3 uniqueness model. During a rolling deployment, manual replay should
+wait until old Stage 3 workers have cut over; they can parse the compatible
+envelope but do not implement generation fencing.
+
 ## Serious alternatives
 
 ### Publish after committing the event
@@ -109,8 +128,9 @@ per-destination scheduling less direct. One message per delivery matches the
 
 - Accepted domain work and durable publish intent are atomic inside
   PostgreSQL.
-- Rollback and concurrent-idempotency tests can inspect exact cardinality: one
-  event, N deliveries, N outbox rows, and zero attempts.
+- Initial-ingestion rollback and concurrency tests inspect exact cardinality:
+  one event, N deliveries, N generation-1 outbox rows, and zero attempts.
+  Each accepted manual replay adds exactly one row for its next generation.
 - PostgreSQL becomes both source of truth and the initial durable handoff, so
   outbox retention, cleanup, indexing, and publisher lag need operational
   monitoring later.

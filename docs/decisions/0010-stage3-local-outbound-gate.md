@@ -37,6 +37,19 @@ Distinguish data corruption from policy:
   not poison. Leave it unacknowledged/recoverable so a later reviewed policy or
   configuration change can process it.
 
+## Stage 4 evolution
+
+Stage 4 replaces repeated unacknowledged policy redelivery with an explicit
+recoverable terminal decision. The executor checks the allowlist while holding
+the delivery row lock, records `dead_lettered_at` and reason `target_blocked`,
+and commits before the worker ACKs. It creates no HTTP attempt. After a reviewed
+allowlist/policy correction, the tenant-scoped manual replay operation starts a
+fresh dispatch generation and outbox identity.
+
+The worker keeps a fixed delayed-NAK fallback only if a target-block exception
+escapes before the executor can persist terminal state. That fallback preserves
+work without returning to raw `AckWait` churn.
+
 ## Serious alternatives
 
 ### Enable arbitrary URLs and document the risk
@@ -58,11 +71,11 @@ and adversarial tests. Pulling them into Stage 3 would obscure the delivery
 state-machine learning goal and invite a partial implementation to be called
 complete.
 
-### Terminate policy-blocked messages
+### ACK policy-blocked messages without durable terminal state
 
 That would discard valid accepted work because of a temporary execution policy.
-Leaving it unacknowledged preserves recoverability and keeps policy separate
-from message corruption. Stage 4/5 will define better operational handling.
+Stage 4 ACKs only after storing an inspectable `target_blocked` state that can
+be manually replayed, keeping policy separate from message corruption.
 
 ## Consequences
 
@@ -71,9 +84,9 @@ from message corruption. Stage 4/5 will define better operational handling.
 - The Compose service name `receiver` exercises real DNS and HTTP without
   contacting a third party.
 - Redirect and environment-proxy paths do not bypass the simple hostname gate.
-- Valid policy-blocked work can remain pending/unacknowledged and repeatedly
-  become eligible after `AckWait`; there is no Stage 4 backoff/dead-letter
-  policy yet.
+- Stage 3 policy-blocked work remained pending/unacknowledged. Stage 4 records
+  `target_blocked`, ACKs after that commit, and recovers only through deliberate
+  replay after a policy fix.
 - The allowlist is not a production SSRF solution. It does not resolve or pin
   addresses, classify IPv4/IPv6 ranges, detect rebinding, or enforce egress.
 - Stage 5 must replace/supersede this ADR before staging or production workers

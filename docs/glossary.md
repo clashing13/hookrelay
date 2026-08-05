@@ -1,6 +1,6 @@
 # HookRelay glossary
 
-This glossary is cumulative through Stage 3 (`0.3.0`). Entries marked
+This glossary is cumulative through Stage 4 (`0.4.0`). Entries marked
 **future** describe planned behavior, not a capability of the current
 repository.
 
@@ -183,14 +183,17 @@ from another tenant even if application code makes a mistake.
 **Delivery**
 
 One intended dispatch of one event to one endpoint. Ingestion creates it in
-`pending` state with a target-URL and signing-secret-version snapshot. Stage 3
-can move it through `delivering` to `succeeded`.
+`pending` state with a target-URL and signing-secret-version snapshot. It can
+move through `delivering` and `retry_scheduled` to `succeeded`, or become
+`dead_lettered`. Manual replay keeps the delivery ID but increments its dispatch
+generation.
 
 **Delivery attempt**
 
-A durable record of one worker try, including its number, start/finish time,
-outcome, response status or sanitized error code, and duration. Stage 3 creates
-it unfinished before HTTP, then updates its completion fields afterward.
+A durable record of one worker try, including its lifetime number, dispatch
+generation, claim token, start/finish time, outcome, response status or
+sanitized error code, and duration. It is created unfinished before HTTP and
+finished as succeeded, transient, permanent, or abandoned.
 
 **Endpoint signing secret**
 
@@ -216,15 +219,18 @@ payloads while requiring their top-level value to be an object.
 
 **Migration**
 
-An ordered, reviewable schema transition. Stage 2's revision creates the domain
-schema; Stage 3's `20260803_0002` revision adds recoverable outbox claim fields,
-constraints, and an index. Editing an ORM model does not update a database.
+An ordered, reviewable schema transition. Stage 2 creates the domain schema;
+Stage 3 adds recoverable outbox claims; Stage 4 revision `20260804_0003` adds
+retry, delivery-claim, generation, terminal, and replay state. Editing an ORM
+model does not update a database.
 
 **Outbox message**
 
-A durable record that dispatch work needs publishing. Each delivery has one
-versioned, ID-only `delivery.requested` row. Stage 3 claims it, waits for a NATS
-PubAck, and only then sets `published_at`.
+A durable record that dispatch work needs publishing. Initial delivery and
+each manual replay generation have one strict schema-v1, ID-only
+`delivery.requested` row with a fresh UUID. The database row, not the broker
+payload, carries authoritative dispatch generation. The publisher waits for a
+NATS PubAck before setting `published_at`.
 
 **Partial index**
 
@@ -271,9 +277,10 @@ guard across all API replicas.
 
 **Webhook endpoint**
 
-A tenant-owned destination name and URL. Stage 3 performs outbound HTTP only
-for explicit local/test allowlist targets; full production SSRF controls arrive
-in Stage 5. The current `enabled` response field maps to stored active state.
+A tenant-owned destination name and URL. Through Stage 4, outbound HTTP runs
+only for explicit local/test allowlist targets; blocked work becomes replayable
+terminal state. Full production SSRF controls arrive in Stage 5. The current
+`enabled` response field maps to stored active state.
 
 ## Idempotency and concurrency terms
 
@@ -318,11 +325,21 @@ A SHA-256 digest of the canonical, versioned logical event request. Comparing
 it distinguishes a safe replay from accidental reuse of a key for different
 work. The version lets future canonicalization rules evolve deliberately.
 
-**Replay**
+**Ingestion replay**
 
-Returning the original creation result for a matching tenant/key/fingerprint.
-This is ingestion replay, not dead-letter redelivery. Dead-letter replay is
-**future**.
+Returning the original creation result for a matching
+tenant/key/fingerprint. It creates no new event, delivery, or outbox row. It is
+different from broker redelivery and dead-letter replay.
+
+**Dead-letter replay**
+
+An authenticated `202` operation that increments a dead-lettered delivery's
+dispatch generation and atomically creates a fresh outbox row. Its JSON request
+must match the generation the operator observed, preventing one ambiguous
+intent from advancing twice. It preserves attempt history and grants the new
+generation a bounded retry budget. Missing/cross-tenant IDs use opaque `404`;
+a valid tenant-owned delivery outside `dead_lettered` returns
+`409 delivery_not_replayable`.
 
 ## Security and cryptography terms
 
@@ -401,10 +418,11 @@ access control, or a secret manager.
 **SSRF (Server-Side Request Forgery)** — **complete defense is future**
 
 Abusing a server's outbound fetch to reach unintended internal or privileged
-targets. Stage 3 sends HTTP only in local/test, checks an explicit hostname
-allowlist, disables redirects, and ignores environment proxies. Those controls
-are not complete SSRF protection: resolved-IP classification, DNS rebinding,
-IPv6/special ranges, and egress controls remain Stage 5 work.
+targets. Stage 4 still sends HTTP only in local/test, checks an explicit
+hostname allowlist, disables redirects, and ignores environment proxies. A
+blocked target becomes a replayable terminal delivery rather than executing.
+Those controls are not complete SSRF protection: resolved-IP classification,
+DNS rebinding, IPv6/special ranges, and egress controls remain Stage 5 work.
 
 **TLS (Transport Layer Security)**
 
@@ -458,14 +476,14 @@ successful attempt and delivery state.
 **Acknowledgment wait (`AckWait`)**
 
 The period JetStream waits for an ACK or progress signal before a message is
-eligible for redelivery. It is not a complete retry schedule and supplies no
-backoff, jitter, or maximum-attempt policy.
+eligible for redelivery. It is a fallback wake-up, not HookRelay's authoritative
+retry schedule; Stage 4 persists due time and uses explicit delayed NAK.
 
 **At-least-once delivery**
 
 A logical event may be attempted more than once so transient or ambiguous
-failures do not silently lose it. Stage 3 implements the success path and
-retains duplicate-publication/HTTP ambiguity; receiver idempotency remains
+failures do not silently lose it. Stage 4 adds bounded retry and crash recovery
+but retains duplicate-publication/HTTP ambiguity; receiver idempotency remains
 required.
 
 **Bounded concurrency**
@@ -487,11 +505,12 @@ later finalize only while its token still matches. Expiry recovers abandoned
 claims. The TTL must exceed the configured sequential batch size multiplied by
 the per-publish timeout.
 
-**Dead letter** — **future**
+**Dead letter**
 
-Work moved to an explicit terminal operational state after retry policy is
-exhausted. The delivery status vocabulary reserves `dead_lettered`, but Stage 3
-has no maximum-attempt or dead-letter behavior. Stage 4 owns it.
+A terminal PostgreSQL delivery state with timestamp and reason
+`permanent_failure`, `attempts_exhausted`, or `target_blocked`. It remains
+inspectable and manually replayable. Stage 4 has no separate dead-letter stream
+or queue.
 
 **Durable consumer**
 
@@ -520,22 +539,25 @@ does not guarantee exactly once.
 
 **NATS JetStream**
 
-The durable message transport between the Stage 3 outbox publisher and delivery
+The durable message transport between the outbox publisher and delivery
 workers. HookRelay uses one file-backed work-queue stream and an explicit-ACK
-durable pull consumer. PostgreSQL remains the domain source of truth.
+durable pull consumer. Delayed NAK requests a later wake-up; PostgreSQL remains
+the domain/retry source of truth.
 
 **Poison message**
 
 An internally malformed command or one whose identities contradict
-authoritative PostgreSQL state. The Stage 3 worker terminates it rather than
-performing HTTP. A destination blocked by the temporary outbound policy is not
-classified as poison and remains unacknowledged/recoverable.
+authoritative PostgreSQL state. The worker terminates it rather than performing
+HTTP. A destination blocked by the temporary outbound policy is valid domain
+work, not poison; Stage 4 persists a replayable `target_blocked` dead letter.
 
 **Policy-blocked delivery**
 
-Valid durable work whose destination is not permitted by the current Stage 3
-local/test runtime and hostname gate. It remains unacknowledged so a later
-reviewed policy/configuration can recover it; it is not silently discarded.
+Valid durable work whose destination is not permitted by the current local/test
+runtime and hostname gate. Stage 4 records terminal reason `target_blocked`
+without an HTTP attempt, ACKs after that commit, and permits manual replay after
+a reviewed policy/configuration change. A fixed delayed NAK remains only a
+fallback if the executor cannot persist the terminal decision.
 
 **Publish acknowledgment (`PubAck`)**
 
@@ -565,6 +587,116 @@ The `v1=` signature prefix plus `HookRelay-Webhook-Version: 1`. It labels the
 current timestamp/body grammar so incompatible changes can be versioned rather
 than silently breaking receivers.
 
+**Abandoned attempt**
+
+An unfinished attempt whose delivery lease expired. Its HTTP outcome is
+unknown, so HookRelay finishes it as `abandoned`, counts it against the current
+generation, and schedules recovery or dead-letters.
+
+**Attempt lease**
+
+A random claim token shared by the attempt and delivery plus a database-time
+expiry stored on the delivery. It permits HTTP outside a database transaction
+while allowing later workers to recover ownership and fence stale finalizers.
+The TTL must exceed HTTP timeout plus an explicit finalization margin; Stage 4
+uses PostgreSQL `clock_timestamp()` for wall-clock comparisons.
+
+**Backoff cap**
+
+The maximum unjittered retry delay. Stage 4 doubles from the base but stops at
+this bound before applying downward jitter.
+
+**Broker delivery count**
+
+How many times JetStream has presented a message. It includes due-time and
+active-lease deferrals, so it is not the number of outbound HTTP attempts and
+does not enforce HookRelay's business attempt maximum.
+
+**Delayed negative acknowledgment (`NAK`)**
+
+A consumer instruction asking JetStream to present a message after a delay.
+HookRelay sends it after a durable retry decision or active-lease check.
+PostgreSQL due state remains authoritative if wake-up timing differs.
+
+**Dispatch generation**
+
+A positive PostgreSQL integer identifying one bounded retry cycle for a
+delivery. Initial work is generation 1; manual replay increments it. The strict
+schema-v1 broker envelope does not carry generation: the worker derives it from
+the exact outbox row after reconciling `message_id`.
+
+**Downward jitter**
+
+A uniform random reduction from an exponential ceiling. With ratio `r`, Stage
+4 selects from `[ceiling * (1-r), ceiling]`, so the delay spreads retries
+without exceeding the cap.
+
+**Exponential backoff**
+
+A retry delay whose ceiling doubles with each attempt in the current dispatch
+generation until a configured maximum. The Stage 4 ceiling is
+`min(max, base * 2^(n-1))`.
+
+**Failure classification**
+
+The explicit policy mapping an observation to success, transient failure, or
+permanent failure. Stage 4 retries timeout/transport errors, `408`, `425`,
+`429`, and `5xx`; it treats other non-2xx statuses as permanent.
+
+**Fencing**
+
+Rejecting an operation from an owner whose lease has been superseded. A Stage
+4 finalizer must match attempt identity, delivery state, dispatch generation,
+claim token, and unexpired database lease.
+
+**Generation attempt number**
+
+The number of attempt rows associated with the current dispatch generation.
+It drives backoff and maximum-attempt policy. Lifetime `attempt_number` remains
+monotonic across manual replay.
+
+**Next attempt time (`next_attempt_at`)**
+
+The database timestamp at or after which a `retry_scheduled` delivery may
+create another HTTP attempt. A constraint requires scheduled status and due
+time together.
+
+**Optimistic generation precondition**
+
+The replay request's `expected_dispatch_generation`. HookRelay compares the
+operator-observed value under a row lock before advancing it. A stale or
+duplicate intent receives `409 delivery_generation_conflict` instead of
+creating another generation.
+
+**Permanent failure**
+
+An outcome the current policy does not retry, such as most `4xx` and all
+redirect responses. It records the attempt, moves the delivery immediately to
+dead letter, and ACKs after the terminal commit.
+
+**Retry budget**
+
+The maximum actual or ambiguous abandoned attempts allowed in one dispatch
+generation. Defaults permit five. Broker presentations that create no attempt
+do not spend it.
+
+**Retry schedule**
+
+Persistent `retry_scheduled` delivery state plus a non-null PostgreSQL due time.
+It survives worker restarts independently of an individual delayed NAK.
+
+**Stale dispatch**
+
+A broker message whose exact outbox row belongs to an older dispatch generation
+than the delivery. A current worker ACKs it without HTTP. During deployment,
+manual replay should wait for Stage 3 workers to drain/cut over because an old
+worker understands the unchanged v1 envelope but not generation fencing.
+
+**Transient failure**
+
+An outcome the current policy may retry, including timeout, async transport
+error, `408`, `425`, `429`, and `5xx`, while the current generation has budget.
+
 ## Testing and operations terms
 
 **`alembic check`**
@@ -574,9 +706,10 @@ It catches some model/migration drift after the migration has been applied.
 
 **Integration test**
 
-A test crossing a real system boundary. Through Stage 3, integration coverage
+A test crossing a real system boundary. Through Stage 4, integration coverage
 uses PostgreSQL, NATS JetStream, and HTTP receiver behavior for migrations,
-claims, constraints, publication, attempts, and the happy path.
+claims, schedules, fencing, publication, attempts, dead letters, replay, and
+the delivery path.
 
 **Test receiver**
 
@@ -605,14 +738,14 @@ production boundary.
 **End-to-end test**
 
 A test that crosses API, PostgreSQL, outbox publisher, JetStream, worker, and
-receiver boundaries. It proves the tested happy path interoperates, not every
-failure schedule, production security, HA, or scale.
+receiver boundaries. It proves the tested success/recovery path interoperates,
+not every process-kill schedule, production security, HA, or scale.
 
 **Test marker**
 
 Pytest metadata for selecting suites. `integration` requires real services;
 `concurrency` highlights overlapping operations; `security` highlights
-authentication/isolation/redaction; `nats` and `e2e` identify Stage 3 broker and
+authentication/isolation/redaction; `nats` and `e2e` identify broker and
 full-path coverage.
 
 **Unit test**
