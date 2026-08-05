@@ -36,7 +36,7 @@ from hookrelay.broker import (
 )
 from hookrelay.config import Settings
 from hookrelay.database import PostgresDatabase
-from hookrelay.delivery import DeliveryExecutor, build_http_client
+from hookrelay.delivery import DeliveryExecutionResult, DeliveryExecutor, build_http_client
 from hookrelay.main import create_app
 from hookrelay.models import Delivery, DeliveryAttempt, Event, OutboxMessage
 from hookrelay.outbox import OutboxClaimLost, TransactionalOutboxPublisher
@@ -466,6 +466,9 @@ class _AckAfterDatabaseProbe:
     async def in_progress(self) -> None:
         await self._message.in_progress()
 
+    async def nak(self, delay: float | None = None) -> None:
+        await self._message.nak(delay)
+
     async def term(self) -> None:
         await self._message.term()
 
@@ -473,9 +476,9 @@ class _AckAfterDatabaseProbe:
 class _RecordingExecutor:
     def __init__(self, executor: DeliveryExecutor) -> None:
         self._executor = executor
-        self.results: list[str] = []
+        self.results: list[DeliveryExecutionResult] = []
 
-    async def execute(self, message: DeliveryRequestedMessage) -> str:
+    async def execute(self, message: DeliveryRequestedMessage) -> DeliveryExecutionResult:
         result = await self._executor.execute(message)
         self.results.append(result)
         return result
@@ -891,7 +894,8 @@ async def test_http_deadline_records_a_bounded_unacknowledged_failure(
         finally:
             await http_client.aclose()
 
-    assert result == "failed"
+    assert result.state == "retry_scheduled"
+    assert result.retry_after_seconds is not None
     assert elapsed < 1.5
     assert len(receiver.state.requests) == 1
     async with database.session_factory() as session:
@@ -901,7 +905,8 @@ async def test_http_deadline_records_a_bounded_unacknowledged_failure(
                 select(DeliveryAttempt).where(DeliveryAttempt.delivery_id == seeded.delivery_id)
             )
         )
-    assert delivery is not None and delivery.status == "pending"
+    assert delivery is not None and delivery.status == "retry_scheduled"
+    assert delivery.next_attempt_at is not None
     assert len(attempts) == 1
     assert attempts[0].outcome == "transient_failure"
     assert attempts[0].error_code == "request_timeout"
@@ -943,11 +948,10 @@ async def test_real_redelivery_of_succeeded_work_skips_second_http_attempt(
             )
 
             first_result = await executor.execute(decode_delivery_message(first_message.data))
-            assert first_result == "succeeded"
+            assert first_result.state == "succeeded"
             assert len(receiver.state.requests) == 1
 
-            # The explicit NAK is a test-harness shortcut for a lost ACK. Production
-            # Stage 3 never NAKs; Stage 4 owns designed retry scheduling.
+            # This explicit NAK simulates a success ACK lost after the durable commit.
             await first_message.nak()
             redelivered = await _fetch_one(subscription)
             assert redelivered.metadata.num_delivered >= 2
@@ -956,7 +960,7 @@ async def test_real_redelivery_of_succeeded_work_skips_second_http_attempt(
             worker = DeliveryWorker(stage3_settings, recording_executor)
             await worker.process_message(redelivered)
 
-            assert recording_executor.results == ["already_succeeded"]
+            assert [result.state for result in recording_executor.results] == ["already_succeeded"]
             assert len(receiver.state.requests) == 1
             await _wait_for_empty_consumer(worker_broker, stage3_settings)
         finally:

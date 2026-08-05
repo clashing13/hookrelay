@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
+from hookrelay.api.deliveries import router as deliveries_router
 from hookrelay.api.endpoints import router as endpoints_router
 from hookrelay.api.errors import register_exception_handlers
 from hookrelay.api.events import router as events_router
@@ -60,6 +61,7 @@ def create_app(
     app.include_router(tenant_router)
     app.include_router(endpoints_router)
     app.include_router(events_router)
+    app.include_router(deliveries_router)
     return app
 
 

@@ -59,6 +59,7 @@ def _validated_message(row: OutboxMessage) -> DeliveryRequestedMessage:
         message.message_id != row.id
         or message.tenant_id != row.tenant_id
         or message.delivery_id != row.delivery_id
+        or message.schema_version != row.schema_version
     ):
         msg = "outbox payload identity does not match its authoritative row"
         raise OutboxContractError(msg)
@@ -186,7 +187,7 @@ class TransactionalOutboxPublisher:
         )
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        """Poll forever with a fixed Stage 3 cadence; backoff policy arrives in Stage 4."""
+        """Poll at a bounded fixed cadence; webhook retry policy is handled downstream."""
 
         while not stop_event.is_set():
             try:

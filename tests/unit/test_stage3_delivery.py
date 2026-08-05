@@ -16,6 +16,7 @@ from hookrelay.broker import (
 )
 from hookrelay.config import Settings
 from hookrelay.delivery import (
+    DeliveryExecutionResult,
     DeliveryTargetBlocked,
     DeliveryWork,
     build_signed_request,
@@ -29,6 +30,10 @@ from hookrelay.worker import DeliveryBrokerMessage, DeliveryWorker
 def _delivery_work() -> DeliveryWork:
     return DeliveryWork(
         attempt_id=UUID(int=5),
+        attempt_number=1,
+        generation_attempt_number=1,
+        dispatch_generation=1,
+        claim_token=UUID(int=6),
         tenant_id=UUID(int=1),
         delivery_id=UUID(int=2),
         event_id=UUID(int=3),
@@ -82,11 +87,11 @@ def test_signature_binds_timestamp_and_exact_body_bytes() -> None:
 
 def test_signed_request_has_stable_identity_headers_and_hides_secret_in_repr() -> None:
     work = _delivery_work()
-    request = build_signed_request(work, 1_700_000_000, "0.3.0")
+    request = build_signed_request(work, 1_700_000_000, "0.4.0")
 
     assert request.headers == {
         "Content-Type": "application/json",
-        "User-Agent": "HookRelay/0.3.0",
+        "User-Agent": "HookRelay/0.4.0",
         "HookRelay-Delivery-Id": str(work.delivery_id),
         "HookRelay-Event-Id": str(work.event_id),
         "HookRelay-Signature": sign_delivery("whsec_test", 1_700_000_000, request.body),
@@ -137,6 +142,7 @@ class _FakeBrokerMessage:
         self.data = data
         self.acknowledgements = 0
         self.progress_updates = 0
+        self.negative_ack_delays: list[float | None] = []
         self.terminations = 0
 
     async def ack_sync(self, _seconds: float = 1.0, /) -> object:
@@ -145,6 +151,9 @@ class _FakeBrokerMessage:
 
     async def in_progress(self) -> None:
         self.progress_updates += 1
+
+    async def nak(self, delay: float | None = None) -> None:
+        self.negative_ack_delays.append(delay)
 
     async def term(self) -> None:
         self.terminations += 1
@@ -158,26 +167,26 @@ class _GatedExecutor:
         self.at_peak = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def execute(self, _message: DeliveryRequestedMessage) -> str:
+    async def execute(self, _message: DeliveryRequestedMessage) -> DeliveryExecutionResult:
         self.active += 1
         self.peak = max(self.peak, self.active)
         if self.active == self.expected_peak:
             self.at_peak.set()
         try:
             await self.release.wait()
-            return "succeeded"
+            return DeliveryExecutionResult("succeeded")
         finally:
             self.active -= 1
 
 
 class _BlockedExecutor:
-    async def execute(self, _message: DeliveryRequestedMessage) -> str:
+    async def execute(self, _message: DeliveryRequestedMessage) -> DeliveryExecutionResult:
         raise DeliveryTargetBlocked("test policy gate")
 
 
 class _FailedExecutor:
-    async def execute(self, _message: DeliveryRequestedMessage) -> str:
-        return "failed"
+    async def execute(self, _message: DeliveryRequestedMessage) -> DeliveryExecutionResult:
+        return DeliveryExecutionResult("retry_scheduled", retry_after_seconds=3.0)
 
 
 @pytest.mark.asyncio
@@ -230,6 +239,7 @@ async def test_worker_keeps_policy_blocked_delivery_recoverable() -> None:
     assert message.terminations == 0
     assert message.acknowledgements == 0
     assert message.progress_updates == 0
+    assert message.negative_ack_delays == [settings.delivery_policy_block_delay_seconds]
 
 
 @pytest.mark.asyncio
@@ -243,3 +253,4 @@ async def test_worker_leaves_failed_attempt_unacknowledged() -> None:
     assert message.acknowledgements == 0
     assert message.terminations == 0
     assert message.progress_updates == 0
+    assert message.negative_ack_delays == [3.0]

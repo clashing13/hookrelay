@@ -1,10 +1,7 @@
 name: hookrelay
 
 x-hookrelay-image: &hookrelay-image
-  build:
-    context: .
-    dockerfile: Dockerfile
-  image: hookrelay-api:stage3
+  image: hookrelay-api:stage4
 
 x-hookrelay-runtime-environment: &hookrelay-runtime-environment
   HOOKRELAY_ENVIRONMENT: local
@@ -33,11 +30,23 @@ x-hookrelay-runtime-environment: &hookrelay-runtime-environment
   HOOKRELAY_DELIVERY_WORKER_CONCURRENCY: ${HOOKRELAY_DELIVERY_WORKER_CONCURRENCY:-8}
   HOOKRELAY_DELIVERY_FETCH_TIMEOUT_SECONDS: ${HOOKRELAY_DELIVERY_FETCH_TIMEOUT_SECONDS:-1}
   HOOKRELAY_DELIVERY_HTTP_TIMEOUT_SECONDS: ${HOOKRELAY_DELIVERY_HTTP_TIMEOUT_SECONDS:-10}
+  HOOKRELAY_DELIVERY_CLAIM_TTL_SECONDS: ${HOOKRELAY_DELIVERY_CLAIM_TTL_SECONDS:-20}
+  HOOKRELAY_DELIVERY_FINALIZATION_MARGIN_SECONDS: ${HOOKRELAY_DELIVERY_FINALIZATION_MARGIN_SECONDS:-5}
+  HOOKRELAY_DELIVERY_MAX_ATTEMPTS: ${HOOKRELAY_DELIVERY_MAX_ATTEMPTS:-5}
+  HOOKRELAY_DELIVERY_RETRY_BASE_SECONDS: ${HOOKRELAY_DELIVERY_RETRY_BASE_SECONDS:-1}
+  HOOKRELAY_DELIVERY_RETRY_MAX_SECONDS: ${HOOKRELAY_DELIVERY_RETRY_MAX_SECONDS:-60}
+  HOOKRELAY_DELIVERY_RETRY_JITTER_RATIO: ${HOOKRELAY_DELIVERY_RETRY_JITTER_RATIO:-0.25}
+  HOOKRELAY_DELIVERY_POLICY_BLOCK_DELAY_SECONDS: ${HOOKRELAY_DELIVERY_POLICY_BLOCK_DELAY_SECONDS:-30}
   HOOKRELAY_DELIVERY_ALLOWED_HOSTS: '${HOOKRELAY_DELIVERY_ALLOWED_HOSTS:-["receiver","127.0.0.1","localhost"]}'
 
 services:
   api:
     <<: *hookrelay-image
+    # Build the shared application image once. The publisher, worker, and test
+    # receiver reuse this tag, avoiding parallel exporters racing for one tag.
+    build:
+      context: .
+      dockerfile: Dockerfile
     environment:
       <<: *hookrelay-runtime-environment
       HOOKRELAY_HOST: 0.0.0.0

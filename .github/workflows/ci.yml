@@ -103,7 +103,7 @@ jobs:
       - name: Validate Compose and build the image
         run: |
           docker compose config --quiet
-          docker build --pull --tag hookrelay:stage3-ci .
+          docker build --pull --tag hookrelay:stage4-ci .
 
       - name: Show NATS logs on failure
         if: failure()

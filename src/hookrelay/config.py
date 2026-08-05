@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     )
 
     service_name: Literal["hookrelay"] = "hookrelay"
-    version: Literal["0.3.0"] = "0.3.0"
+    version: Literal["0.4.0"] = "0.4.0"
     environment: Literal["local", "test", "staging", "production"] = "local"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     host: str = "127.0.0.1"
@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     delivery_worker_concurrency: int = Field(default=8, ge=1, le=100)
     delivery_fetch_timeout_seconds: float = Field(default=1.0, gt=0, le=30)
     delivery_http_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    delivery_claim_ttl_seconds: float = Field(default=20.0, ge=2, le=600)
+    delivery_finalization_margin_seconds: float = Field(default=5.0, ge=0.5, le=60)
+    delivery_max_attempts: int = Field(default=5, ge=1, le=100)
+    delivery_retry_base_seconds: float = Field(default=1.0, ge=0.1, le=3600)
+    delivery_retry_max_seconds: float = Field(default=60.0, ge=0.1, le=86_400)
+    delivery_retry_jitter_ratio: float = Field(default=0.25, ge=0, le=1)
+    delivery_policy_block_delay_seconds: float = Field(default=30.0, ge=1, le=3600)
     delivery_allowed_hosts: frozenset[str] = frozenset({"127.0.0.1", "localhost", "receiver"})
 
     @field_validator("database_url", mode="before")
@@ -185,6 +192,17 @@ class Settings(BaseSettings):
         if self.nats_ack_wait_seconds < self.delivery_http_timeout_seconds + 5:
             msg = "nats_ack_wait_seconds must exceed delivery_http_timeout_seconds by 5 seconds"
             raise ValueError(msg)
+        if self.delivery_claim_ttl_seconds <= (
+            self.delivery_http_timeout_seconds + self.delivery_finalization_margin_seconds
+        ):
+            msg = (
+                "delivery_claim_ttl_seconds must exceed delivery_http_timeout_seconds "
+                "plus delivery_finalization_margin_seconds"
+            )
+            raise ValueError(msg)
+        if self.delivery_retry_max_seconds < self.delivery_retry_base_seconds:
+            msg = "delivery_retry_max_seconds must be at least delivery_retry_base_seconds"
+            raise ValueError(msg)
         worst_case_batch_publish_seconds = (
             self.outbox_batch_size * self.nats_publish_timeout_seconds
         )
@@ -206,12 +224,17 @@ class Settings(BaseSettings):
 
         return self.nats_url.get_secret_value()
 
-    def require_stage3_delivery_runtime(self) -> None:
+    def require_delivery_runtime(self) -> None:
         """Fail closed outside local/test until Stage 5 implements complete SSRF controls."""
 
         if self.environment not in {"local", "test"}:
-            msg = "Stage 3 delivery workers are restricted to local and test environments"
+            msg = "Delivery workers are restricted to local and test environments until Stage 5"
             raise RuntimeError(msg)
+
+    def require_stage3_delivery_runtime(self) -> None:
+        """Retain the Stage 3 public helper while callers migrate to the current name."""
+
+        self.require_delivery_runtime()
 
 
 @lru_cache
