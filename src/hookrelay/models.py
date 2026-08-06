@@ -121,6 +121,71 @@ class WebhookEndpoint(CreatedAtMixin, Base):
     )
 
 
+class EndpointTrafficControl(Base):
+    """Shared rate-limit and circuit-breaker state for one tenant endpoint."""
+
+    __tablename__ = "endpoint_traffic_controls"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "endpoint_id"],
+            ["webhook_endpoints.tenant_id", "webhook_endpoints.id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("rate_window_count >= 0", name="rate_window_count_nonnegative"),
+        CheckConstraint(
+            "rate_window_started_at IS NOT NULL OR rate_window_count = 0",
+            name="rate_window_state_consistent",
+        ),
+        CheckConstraint(
+            "circuit_state IN ('closed', 'open', 'half_open')",
+            name="circuit_state_valid",
+        ),
+        CheckConstraint(
+            "circuit_consecutive_failures >= 0",
+            name="circuit_consecutive_failures_nonnegative",
+        ),
+        CheckConstraint(
+            "circuit_state = 'closed' OR circuit_consecutive_failures > 0",
+            name="nonclosed_circuit_has_failures",
+        ),
+        CheckConstraint(
+            "((circuit_state = 'closed' AND circuit_opened_at IS NULL "
+            "AND probe_token IS NULL AND probe_expires_at IS NULL) OR "
+            "(circuit_state = 'open' AND circuit_opened_at IS NOT NULL "
+            "AND probe_token IS NULL AND probe_expires_at IS NULL) OR "
+            "(circuit_state = 'half_open' AND circuit_opened_at IS NOT NULL "
+            "AND probe_token IS NOT NULL AND probe_expires_at IS NOT NULL))",
+            name="circuit_state_consistent",
+        ),
+        CheckConstraint(
+            "probe_expires_at IS NULL OR probe_expires_at > circuit_opened_at",
+            name="probe_expiry_after_circuit_opened",
+        ),
+    )
+
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    endpoint_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    rate_window_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rate_window_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    circuit_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="closed", server_default="closed"
+    )
+    circuit_consecutive_failures: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    circuit_opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    probe_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    probe_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class EndpointSigningSecret(CreatedAtMixin, Base):
     """One encrypted secret version retained for accepted delivery snapshots."""
 
@@ -362,6 +427,9 @@ class DeliveryAttempt(Base):
         Integer, nullable=False, default=1, server_default="1"
     )
     claim_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    is_circuit_probe: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

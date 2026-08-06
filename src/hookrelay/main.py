@@ -15,7 +15,9 @@ from hookrelay.api.tenants import router as bootstrap_router
 from hookrelay.api.tenants import tenant_router
 from hookrelay.config import Settings, get_settings
 from hookrelay.database import DatabaseHealth, PostgresDatabase
+from hookrelay.destination_policy import DestinationPolicy
 from hookrelay.logging import configure_logging
+from hookrelay.request_limits import RequestBodyLimitMiddleware
 from hookrelay.security import SecretCipher
 
 
@@ -37,6 +39,11 @@ def create_app(
             app_settings.secret_encryption_key_bytes(),
             app_settings.secret_encryption_key_version,
         )
+        app.state.destination_policy = DestinationPolicy(
+            environment=app_settings.environment,
+            local_exempt_hosts=app_settings.delivery_allowed_hosts,
+            dns_timeout_seconds=app_settings.delivery_dns_timeout_seconds,
+        )
         logger.info(
             "application_started",
             extra={"service": app_settings.service_name, "version": app_settings.version},
@@ -54,6 +61,10 @@ def create_app(
         title="HookRelay API",
         version=app_settings.version,
         lifespan=lifespan,
+    )
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_body_bytes=app_settings.max_request_body_bytes,
     )
     register_exception_handlers(app)
     app.include_router(health_router)

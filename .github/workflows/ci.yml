@@ -103,7 +103,21 @@ jobs:
       - name: Validate Compose and build the image
         run: |
           docker compose config --quiet
-          docker build --pull --tag hookrelay:stage4-ci .
+          docker build --pull --tag hookrelay-api:stage5 .
+
+      - name: Verify the least-privilege application runtime
+        run: >-
+          docker compose run --rm --no-deps --entrypoint python api -c
+          "import os, pathlib;
+          status = dict(line.rstrip().split(':', 1) for line in open('/proc/self/status'));
+          root_options = next(line.split()[3] for line in open('/proc/mounts') if line.split()[1] == '/');
+          pids_max = pathlib.Path('/sys/fs/cgroup/pids.max');
+          assert os.getuid() == 10001 and os.getgid() == 10001;
+          assert status['CapEff'].strip() == '0000000000000000';
+          assert status['NoNewPrivs'].strip() == '1';
+          assert 'ro' in root_options.split(',');
+          assert not pids_max.exists() or pids_max.read_text().strip() == '256';
+          pathlib.Path('/tmp/hookrelay-ci-write-check').write_text('ok')"
 
       - name: Show NATS logs on failure
         if: failure()

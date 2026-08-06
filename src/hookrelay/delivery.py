@@ -10,7 +10,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
-from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import httpx2 as httpx
@@ -24,14 +23,21 @@ from hookrelay.broker import (
     DeliveryRequestedMessage,
 )
 from hookrelay.config import Settings
+from hookrelay.destination_policy import (
+    DestinationPolicy,
+    DestinationPolicyBlocked,
+    SSRFSafeAsyncTransport,
+)
 from hookrelay.models import (
     Delivery,
     DeliveryAttempt,
     EndpointSigningSecret,
+    EndpointTrafficControl,
     Event,
     OutboxMessage,
 )
 from hookrelay.security import SecretCipher
+from hookrelay.traffic_control import admit_endpoint_traffic, record_circuit_outcome
 
 WEBHOOK_SCHEMA_VERSION = 1
 SIGNATURE_VERSION = "v1"
@@ -47,7 +53,7 @@ class DeliveryClaimLost(RuntimeError):
 
 
 class DeliveryTargetBlocked(RuntimeError):
-    """A valid delivery is temporarily outside the pre-Stage-5 destination allowlist."""
+    """A delivery target violates the Stage 5 outbound destination policy."""
 
 
 DeliveryExecutionState = Literal[
@@ -96,6 +102,7 @@ class DeliveryWork:
     event_created_at: datetime
     payload: dict[str, JsonValue]
     signing_secret: str = field(repr=False)
+    circuit_probe: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,16 +242,14 @@ class DeliveryExecutor:
         self._session_factory = session_factory
         self._secret_cipher = secret_cipher
         self._http_client = http_client
+        self._destination_policy = DestinationPolicy(
+            environment=settings.environment,
+            local_exempt_hosts=settings.delivery_allowed_hosts,
+            dns_timeout_seconds=settings.delivery_dns_timeout_seconds,
+        )
         self._clock = clock or (lambda: datetime.now(UTC))
         self._monotonic = monotonic
         self._random_source = random_source
-
-    def _require_allowed_target(self, target_url: str) -> None:
-        hostname = urlsplit(target_url).hostname
-        normalized = hostname.lower().rstrip(".") if hostname is not None else ""
-        if normalized not in self._settings.delivery_allowed_hosts:
-            msg = "delivery target is outside the local/test host allowlist"
-            raise DeliveryTargetBlocked(msg)
 
     def _retry_delay(self, generation_attempt_number: int) -> float:
         return retry_delay_seconds(
@@ -277,6 +282,54 @@ class DeliveryExecutor:
         if database_now is None:
             raise RuntimeError("PostgreSQL did not return its current time")
         return database_now
+
+    @staticmethod
+    async def _lock_traffic_control(
+        session: AsyncSession,
+        delivery: Delivery,
+    ) -> EndpointTrafficControl:
+        control = await session.scalar(
+            select(EndpointTrafficControl)
+            .where(
+                EndpointTrafficControl.tenant_id == delivery.tenant_id,
+                EndpointTrafficControl.endpoint_id == delivery.endpoint_id,
+            )
+            .with_for_update()
+        )
+        if control is None:
+            raise DeliveryMessageRejected("endpoint traffic-control state is missing")
+        return control
+
+    @classmethod
+    def _defer_delivery_until(
+        cls,
+        delivery: Delivery,
+        *,
+        database_now: datetime,
+        retry_at: datetime,
+    ) -> DeliveryExecutionResult:
+        delay = max(MIN_REDELIVERY_DELAY_SECONDS, (retry_at - database_now).total_seconds())
+        delivery.status = "retry_scheduled"
+        delivery.next_attempt_at = database_now + timedelta(seconds=delay)
+        delivery.dead_lettered_at = None
+        delivery.dead_letter_reason = None
+        delivery.claim_token = None
+        delivery.claim_expires_at = None
+        return cls._retry_result(delay, state="retry_scheduled")
+
+    def _respect_open_circuit(
+        self,
+        control: EndpointTrafficControl,
+        database_now: datetime,
+        proposed_retry_at: datetime,
+    ) -> datetime:
+        if control.circuit_state != "open" or control.circuit_opened_at is None:
+            return proposed_retry_at
+        return max(
+            proposed_retry_at,
+            control.circuit_opened_at
+            + timedelta(seconds=self._settings.delivery_circuit_cooldown_seconds),
+        )
 
     async def _generation_attempt_count(
         self,
@@ -387,6 +440,13 @@ class DeliveryExecutor:
                     delivery.id,
                     delivery.dispatch_generation,
                 )
+                control = await self._lock_traffic_control(session, delivery)
+                database_now = await self._database_now(session)
+                abandoned_was_current_probe = (
+                    unfinished_attempt.is_circuit_probe
+                    and control.circuit_state == "half_open"
+                    and control.probe_token == unfinished_attempt.claim_token
+                )
                 unfinished_attempt.finished_at = max(database_now, unfinished_attempt.started_at)
                 unfinished_attempt.outcome = "abandoned"
                 unfinished_attempt.error_code = "worker_lease_expired"
@@ -396,17 +456,33 @@ class DeliveryExecutor:
                 )
                 delivery.claim_token = None
                 delivery.claim_expires_at = None
+                if abandoned_was_current_probe or (
+                    not unfinished_attempt.is_circuit_probe and control.circuit_state != "half_open"
+                ):
+                    record_circuit_outcome(
+                        control,
+                        outcome="transient_failure",
+                        database_now=database_now,
+                        failure_threshold=self._settings.delivery_circuit_failure_threshold,
+                        was_probe=abandoned_was_current_probe,
+                    )
                 if generation_attempts >= self._settings.delivery_max_attempts:
                     self._dead_letter(delivery, database_now, "attempts_exhausted")
                     await session.commit()
                     return DeliveryExecutionResult("dead_lettered")
                 delay = self._retry_delay(generation_attempts)
-                delivery.status = "retry_scheduled"
-                delivery.next_attempt_at = database_now + timedelta(seconds=delay)
-                delivery.dead_lettered_at = None
-                delivery.dead_letter_reason = None
+                retry_at = self._respect_open_circuit(
+                    control,
+                    database_now,
+                    database_now + timedelta(seconds=delay),
+                )
+                result = self._defer_delivery_until(
+                    delivery,
+                    database_now=database_now,
+                    retry_at=retry_at,
+                )
                 await session.commit()
-                return self._retry_result(delay, state="retry_scheduled")
+                return result
 
             if unfinished_attempt is not None:
                 raise DeliveryMessageRejected("non-delivering state has an unfinished attempt")
@@ -421,11 +497,12 @@ class DeliveryExecutor:
                 raise DeliveryMessageRejected("delivery state is not executable")
 
             try:
-                self._require_allowed_target(delivery.target_url)
-            except DeliveryTargetBlocked:
+                self._destination_policy.validate_url(httpx.URL(delivery.target_url))
+            except DestinationPolicyBlocked:
                 self._dead_letter(delivery, database_now, "target_blocked")
                 await session.commit()
                 return DeliveryExecutionResult("dead_lettered")
+
             generation_attempts = await self._generation_attempt_count(
                 session,
                 delivery.id,
@@ -435,6 +512,26 @@ class DeliveryExecutor:
                 self._dead_letter(delivery, database_now, "attempts_exhausted")
                 await session.commit()
                 return DeliveryExecutionResult("dead_lettered")
+
+            control = await self._lock_traffic_control(session, delivery)
+            database_now = await self._database_now(session)
+            claim_token = uuid4()
+            admission = admit_endpoint_traffic(
+                control,
+                database_now=database_now,
+                claim_token=claim_token,
+                settings=self._settings,
+            )
+            if not admission.allowed:
+                if admission.retry_at is None:
+                    raise RuntimeError("traffic deferral is missing its due time")
+                result = self._defer_delivery_until(
+                    delivery,
+                    database_now=database_now,
+                    retry_at=admission.retry_at,
+                )
+                await session.commit()
+                return result
 
             event = await session.scalar(
                 select(Event).where(
@@ -468,7 +565,6 @@ class DeliveryExecutor:
             # it. Dependency loading and secret decryption above must not consume
             # the worker's configured finalization margin.
             claim_started_at = await self._database_now(session)
-            claim_token = uuid4()
             attempt = DeliveryAttempt(
                 id=uuid4(),
                 tenant_id=delivery.tenant_id,
@@ -476,6 +572,7 @@ class DeliveryExecutor:
                 attempt_number=int(last_attempt_number or 0) + 1,
                 dispatch_generation=delivery.dispatch_generation,
                 claim_token=claim_token,
+                is_circuit_probe=admission.is_probe,
                 started_at=claim_started_at,
             )
             session.add(attempt)
@@ -487,6 +584,8 @@ class DeliveryExecutor:
             delivery.claim_expires_at = claim_started_at + timedelta(
                 seconds=self._settings.delivery_claim_ttl_seconds
             )
+            if admission.is_probe:
+                control.probe_expires_at = delivery.claim_expires_at
             await session.flush()
             work = DeliveryWork(
                 attempt_id=attempt.id,
@@ -503,6 +602,7 @@ class DeliveryExecutor:
                 event_created_at=event.created_at,
                 payload=cast("dict[str, JsonValue]", event.payload),
                 signing_secret=raw_secret,
+                circuit_probe=admission.is_probe,
             )
             await session.commit()
             return work
@@ -515,6 +615,7 @@ class DeliveryExecutor:
         response_status_code: int | None,
         error_code: str | None,
         duration_ms: int,
+        target_blocked: bool = False,
     ) -> DeliveryExecutionResult:
         async with self._session_factory() as session:
             delivery = await session.scalar(
@@ -526,21 +627,28 @@ class DeliveryExecutor:
                 .with_for_update()
             )
             attempt = await session.get(DeliveryAttempt, work.attempt_id)
-            database_now = await self._database_now(session)
             if (
                 delivery is None
                 or attempt is None
                 or attempt.delivery_id != work.delivery_id
                 or attempt.finished_at is not None
                 or attempt.claim_token != work.claim_token
+                or attempt.is_circuit_probe != work.circuit_probe
                 or attempt.dispatch_generation != work.dispatch_generation
                 or delivery.status != "delivering"
                 or delivery.dispatch_generation != work.dispatch_generation
                 or delivery.claim_token != work.claim_token
                 or delivery.claim_expires_at is None
-                or delivery.claim_expires_at <= database_now
             ):
                 raise DeliveryClaimLost("attempt ownership changed before finalization")
+            control = await self._lock_traffic_control(session, delivery)
+            database_now = await self._database_now(session)
+            if delivery.claim_expires_at <= database_now:
+                raise DeliveryClaimLost("attempt ownership changed before finalization")
+            if work.circuit_probe and (
+                control.circuit_state != "half_open" or control.probe_token != work.claim_token
+            ):
+                raise DeliveryClaimLost("circuit probe ownership changed before finalization")
             attempt.finished_at = max(database_now, attempt.started_at)
             attempt.outcome = outcome
             attempt.response_status_code = response_status_code
@@ -548,8 +656,19 @@ class DeliveryExecutor:
             attempt.duration_ms = duration_ms
             delivery.claim_token = None
             delivery.claim_expires_at = None
+            if work.circuit_probe or control.circuit_state != "half_open":
+                record_circuit_outcome(
+                    control,
+                    outcome="target_blocked" if target_blocked else outcome,
+                    database_now=database_now,
+                    failure_threshold=self._settings.delivery_circuit_failure_threshold,
+                    was_probe=work.circuit_probe,
+                )
 
-            if outcome == "succeeded":
+            if target_blocked:
+                self._dead_letter(delivery, database_now, "target_blocked")
+                result = DeliveryExecutionResult("dead_lettered")
+            elif outcome == "succeeded":
                 delivery.status = "succeeded"
                 delivery.next_attempt_at = None
                 delivery.dead_lettered_at = None
@@ -567,11 +686,16 @@ class DeliveryExecutor:
                 result = DeliveryExecutionResult("dead_lettered")
             else:
                 delay = self._retry_delay(work.generation_attempt_number)
-                delivery.status = "retry_scheduled"
-                delivery.next_attempt_at = database_now + timedelta(seconds=delay)
-                delivery.dead_lettered_at = None
-                delivery.dead_letter_reason = None
-                result = self._retry_result(delay, state="retry_scheduled")
+                retry_at = self._respect_open_circuit(
+                    control,
+                    database_now,
+                    database_now + timedelta(seconds=delay),
+                )
+                result = self._defer_delivery_until(
+                    delivery,
+                    database_now=database_now,
+                    retry_at=retry_at,
+                )
             await session.commit()
             return result
 
@@ -587,6 +711,7 @@ class DeliveryExecutor:
         started = self._monotonic()
         response_status_code: int | None = None
         error_code: str | None = None
+        target_blocked = False
         outcome: AttemptOutcome
         try:
             async with asyncio.timeout(self._settings.delivery_http_timeout_seconds):
@@ -604,6 +729,10 @@ class DeliveryExecutor:
                         error_code = "invalid_http_status"
                     if outcome != "succeeded":
                         error_code = error_code or "http_status"
+        except DestinationPolicyBlocked:
+            outcome = "permanent_failure"
+            error_code = "target_blocked"
+            target_blocked = True
         except TimeoutError:
             outcome = "transient_failure"
             error_code = "request_timeout"
@@ -618,6 +747,7 @@ class DeliveryExecutor:
             response_status_code=response_status_code,
             error_code=error_code,
             duration_ms=duration_ms,
+            target_blocked=target_blocked,
         )
 
 
@@ -630,13 +760,18 @@ def build_http_client(settings: Settings) -> httpx.AsyncClient:
         write=settings.delivery_http_timeout_seconds,
         pool=settings.delivery_http_timeout_seconds,
     )
-    limits = httpx.Limits(
+    policy = DestinationPolicy(
+        environment=settings.environment,
+        local_exempt_hosts=settings.delivery_allowed_hosts,
+        dns_timeout_seconds=settings.delivery_dns_timeout_seconds,
+    )
+    transport = SSRFSafeAsyncTransport(
+        policy,
         max_connections=settings.delivery_worker_concurrency,
-        max_keepalive_connections=settings.delivery_worker_concurrency,
     )
     return httpx.AsyncClient(
+        transport=transport,
         timeout=timeout,
-        limits=limits,
         follow_redirects=False,
         trust_env=False,
     )
