@@ -42,7 +42,7 @@ async def test_readiness_contract_when_database_is_usable() -> None:
     assert response.json() == {
         "status": "ok",
         "service": "hookrelay",
-        "version": "0.4.0",
+        "version": "0.5.0",
     }
 
 
@@ -60,7 +60,7 @@ async def test_readiness_failure_is_sanitized_and_liveness_stays_healthy() -> No
     assert readiness_response.json() == {
         "status": "unavailable",
         "service": "hookrelay",
-        "version": "0.4.0",
+        "version": "0.5.0",
     }
     assert leaked_secret not in readiness_response.text
     assert liveness_response.status_code == 200

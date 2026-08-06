@@ -167,7 +167,7 @@ async def _provision_endpoint(
     tenant: ProvisionedTenant,
     label: str,
 ) -> ProvisionedEndpoint:
-    url = f"https://receiver.example/{label}/{uuid4()}"
+    url = f"https://receiver/{label}/{uuid4()}"
     response = await client.post(
         "/v1/endpoints",
         headers={"Authorization": f"Bearer {tenant.api_key}"},

@@ -75,6 +75,7 @@ def test_staging_accepts_a_unique_canonical_256_bit_encryption_key() -> None:
         environment="staging",
         secret_encryption_key=encoded_key,
         secret_encryption_key_version=17,
+        delivery_allowed_hosts=frozenset(),
         _env_file=None,
     )
 
@@ -172,7 +173,7 @@ def test_worker_backpressure_and_timeout_budgets_must_align() -> None:
         )
 
 
-def test_stage3_worker_is_gated_to_explicit_local_test_hosts() -> None:
+def test_stage5_private_host_exemptions_are_local_test_only() -> None:
     settings = Settings(
         environment="test",
         delivery_allowed_hosts=frozenset({" Receiver ", "LOCALHOST."}),
@@ -182,17 +183,40 @@ def test_stage3_worker_is_gated_to_explicit_local_test_hosts() -> None:
     settings.require_stage3_delivery_runtime()
     assert settings.delivery_allowed_hosts == frozenset({"receiver", "localhost"})
 
+    with pytest.raises(ValidationError, match="forbid private delivery host exemptions"):
+        Settings(
+            environment="production",
+            secret_encryption_key=base64.urlsafe_b64encode(b"P" * 32).decode("ascii"),
+            _env_file=None,
+        )
+
     production = Settings(
         environment="production",
         secret_encryption_key=base64.urlsafe_b64encode(b"P" * 32).decode("ascii"),
+        delivery_allowed_hosts=frozenset(),
         _env_file=None,
     )
-    with pytest.raises(RuntimeError, match="restricted to local and test"):
-        production.require_stage3_delivery_runtime()
+    production.require_stage3_delivery_runtime()
 
 
-def test_delivery_host_allowlist_rejects_empty_and_wildcard_values() -> None:
-    with pytest.raises(ValidationError):
-        Settings(delivery_allowed_hosts=frozenset(), _env_file=None)
+def test_delivery_host_exemptions_allow_empty_but_reject_wildcards() -> None:
+    assert Settings(delivery_allowed_hosts=frozenset(), _env_file=None).delivery_allowed_hosts == (
+        frozenset()
+    )
     with pytest.raises(ValidationError):
         Settings(delivery_allowed_hosts=frozenset({"*"}), _env_file=None)
+
+
+def test_stage5_security_budget_relationships_are_validated() -> None:
+    with pytest.raises(ValidationError, match="max_event_payload_bytes"):
+        Settings(
+            max_request_body_bytes=1_024,
+            max_event_payload_bytes=1_025,
+            _env_file=None,
+        )
+    with pytest.raises(ValidationError, match="delivery_circuit_cooldown_seconds"):
+        Settings(
+            delivery_claim_ttl_seconds=31,
+            delivery_circuit_cooldown_seconds=30,
+            _env_file=None,
+        )

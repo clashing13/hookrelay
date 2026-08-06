@@ -257,7 +257,7 @@ async def test_endpoint_signing_secret_is_one_time_and_ciphertext_only_at_rest()
     async with api_client(app) as client:
         created = await client.post(
             "/v1/endpoints",
-            json={"name": "orders", "url": "https://receiver.example/webhooks"},
+            json={"name": "orders", "url": "http://receiver:9000/webhooks"},
         )
 
         assert created.status_code == 201

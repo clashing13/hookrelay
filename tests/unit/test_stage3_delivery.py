@@ -87,11 +87,11 @@ def test_signature_binds_timestamp_and_exact_body_bytes() -> None:
 
 def test_signed_request_has_stable_identity_headers_and_hides_secret_in_repr() -> None:
     work = _delivery_work()
-    request = build_signed_request(work, 1_700_000_000, "0.4.0")
+    request = build_signed_request(work, 1_700_000_000, "0.5.0")
 
     assert request.headers == {
         "Content-Type": "application/json",
-        "User-Agent": "HookRelay/0.4.0",
+        "User-Agent": "HookRelay/0.5.0",
         "HookRelay-Delivery-Id": str(work.delivery_id),
         "HookRelay-Event-Id": str(work.event_id),
         "HookRelay-Signature": sign_delivery("whsec_test", 1_700_000_000, request.body),
