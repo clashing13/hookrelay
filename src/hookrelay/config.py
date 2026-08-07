@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     )
 
     service_name: Literal["hookrelay"] = "hookrelay"
-    version: Literal["0.4.0"] = "0.4.0"
+    version: Literal["0.5.0"] = "0.5.0"
     environment: Literal["local", "test", "staging", "production"] = "local"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     host: str = "127.0.0.1"
@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     database_pool_size: int = Field(default=5, ge=1, le=50)
     database_max_overflow: int = Field(default=10, ge=0, le=100)
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    max_request_body_bytes: int = Field(default=1_048_576, ge=1_024, le=16_777_216)
+    max_event_payload_bytes: int = Field(default=262_144, ge=1, le=1_048_576)
     secret_encryption_key: SecretStr = SecretStr(DEVELOPMENT_SECRET_ENCRYPTION_KEY)
     secret_encryption_key_version: int = Field(default=1, ge=1, le=32767)
     bootstrap_enabled: bool = False
@@ -68,6 +70,11 @@ class Settings(BaseSettings):
     delivery_retry_max_seconds: float = Field(default=60.0, ge=0.1, le=86_400)
     delivery_retry_jitter_ratio: float = Field(default=0.25, ge=0, le=1)
     delivery_policy_block_delay_seconds: float = Field(default=30.0, ge=1, le=3600)
+    delivery_dns_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    delivery_rate_limit_requests: int = Field(default=10, ge=1, le=10_000)
+    delivery_rate_limit_window_seconds: float = Field(default=1.0, ge=0.1, le=3600)
+    delivery_circuit_failure_threshold: int = Field(default=5, ge=1, le=100)
+    delivery_circuit_cooldown_seconds: float = Field(default=30.0, ge=1, le=86_400)
     delivery_allowed_hosts: frozenset[str] = frozenset({"127.0.0.1", "localhost", "receiver"})
 
     @field_validator("database_url", mode="before")
@@ -160,14 +167,14 @@ class Settings(BaseSettings):
     @field_validator("delivery_allowed_hosts")
     @classmethod
     def normalize_delivery_allowed_hosts(cls, value: frozenset[str]) -> frozenset[str]:
-        """Require an explicit local/test allowlist until Stage 5 adds SSRF defenses."""
+        """Normalize the deliberate local/test-only private-destination exemptions."""
 
         normalized = frozenset(host.strip().lower().rstrip(".") for host in value)
-        if not normalized or any(
+        if any(
             not host or any(character.isspace() for character in host) or host == "*"
             for host in normalized
         ):
-            msg = "delivery_allowed_hosts must contain explicit non-wildcard hostnames"
+            msg = "delivery_allowed_hosts may contain only explicit non-wildcard hostnames"
             raise ValueError(msg)
         return normalized
 
@@ -186,6 +193,9 @@ class Settings(BaseSettings):
             if self.bootstrap_token is None or len(self.bootstrap_token.get_secret_value()) < 32:
                 msg = "enabled bootstrap requires a token of at least 32 characters"
                 raise ValueError(msg)
+        if self.environment in {"staging", "production"} and self.delivery_allowed_hosts:
+            msg = "staging and production forbid private delivery host exemptions"
+            raise ValueError(msg)
         if self.nats_max_ack_pending < self.delivery_worker_concurrency:
             msg = "nats_max_ack_pending must be at least delivery_worker_concurrency"
             raise ValueError(msg)
@@ -200,8 +210,14 @@ class Settings(BaseSettings):
                 "plus delivery_finalization_margin_seconds"
             )
             raise ValueError(msg)
+        if self.delivery_circuit_cooldown_seconds < self.delivery_claim_ttl_seconds:
+            msg = "delivery_circuit_cooldown_seconds must be at least delivery_claim_ttl_seconds"
+            raise ValueError(msg)
         if self.delivery_retry_max_seconds < self.delivery_retry_base_seconds:
             msg = "delivery_retry_max_seconds must be at least delivery_retry_base_seconds"
+            raise ValueError(msg)
+        if self.max_event_payload_bytes > self.max_request_body_bytes:
+            msg = "max_event_payload_bytes must not exceed max_request_body_bytes"
             raise ValueError(msg)
         worst_case_batch_publish_seconds = (
             self.outbox_batch_size * self.nats_publish_timeout_seconds
@@ -225,11 +241,7 @@ class Settings(BaseSettings):
         return self.nats_url.get_secret_value()
 
     def require_delivery_runtime(self) -> None:
-        """Fail closed outside local/test until Stage 5 implements complete SSRF controls."""
-
-        if self.environment not in {"local", "test"}:
-            msg = "Delivery workers are restricted to local and test environments until Stage 5"
-            raise RuntimeError(msg)
+        """Retain one explicit startup hook for validated Stage 5 worker settings."""
 
     def require_stage3_delivery_runtime(self) -> None:
         """Retain the Stage 3 public helper while callers migrate to the current name."""

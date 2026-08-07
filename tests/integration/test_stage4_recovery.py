@@ -531,8 +531,15 @@ async def test_policy_blocked_target_is_persistently_dead_lettered_without_http_
     seeded = await _seed_delivery(
         stage4_settings,
         database,
-        "http://blocked.example/webhooks",
+        "http://127.0.0.1:9/webhooks",
     )
+    async with database.session_factory() as session:
+        delivery = await session.get(Delivery, seeded.delivery_id)
+        assert delivery is not None
+        # Model a destination snapshot accepted before Stage 5 added the
+        # creation-time guard; the worker must still fail closed at execution.
+        delivery.target_url = "http://169.254.169.254/latest/meta-data"
+        await session.commit()
     message = await _message_for_outbox(database, seeded.outbox_id)
 
     async with _delivery_runtime(stage4_settings, database) as (_worker, executor):

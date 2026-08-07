@@ -1,16 +1,19 @@
 # HookRelay
 
 HookRelay is a fault-tolerant webhook-delivery platform built as a seven-stage
-distributed-systems learning project. Version `0.4.0` implements durable event
-acceptance, signed delivery, and bounded failure recovery:
+distributed-systems learning project. Version `0.5.0` adds security and
+per-endpoint traffic control to the durable Stage 4 delivery loop:
 
 ```text
 Producer
-  -> FastAPI
+  -> FastAPI request-byte and tenant-authorization boundary
+       -> endpoint URL preflight / signing-secret rotation
   -> PostgreSQL event + transactional outbox
   -> outbox publisher
   -> NATS JetStream
   -> bounded delivery worker
+       -> shared PostgreSQL rate/circuit admission
+       -> DNS/IP validation + IP-pinned connection
        -> success
        -> persistent retry schedule + delayed NAK
        -> expired worker-claim recovery
@@ -18,15 +21,21 @@ Producer
   -> authenticated manual replay as a fresh dispatch generation
 ```
 
-Start with the [Stage 4 failure-recovery guide](docs/stages/04-failure-recovery.md)
-for the complete state machine, exact backoff formula, crash exercise, tests,
-and teach-back checklist. The [Stage 3](docs/stages/03-delivery-pipeline.md),
+Start with the
+[Stage 5 security and traffic-control guide](docs/stages/05-security-traffic-control.md)
+for the threat model, exact policies, safe exercises, tests, and teach-back
+checklist. The [Stage 4](docs/stages/04-failure-recovery.md),
+[Stage 3](docs/stages/03-delivery-pipeline.md),
 [Stage 2](docs/stages/02-event-ingestion.md), and
 [Stage 1](docs/stages/01-foundation.md) guides preserve the earlier boundaries.
 
-## Stage 4 capabilities
+## Stage 5 capabilities
 
 - authenticated, tenant-scoped, idempotent event ingestion;
+- opaque missing/cross-tenant resource behavior plus composite tenant foreign
+  keys at the database boundary;
+- a one-MiB ASGI request-body cap that counts actual streamed bytes before
+  routing/parsing, and a 256-KiB canonical UTF-8 event-payload cap;
 - one PostgreSQL transaction for an event, delivery snapshots, and one fresh
   versioned outbox row per destination/generation;
 - expiring outbox publisher claims and PubAck-before-`published_at` ordering;
@@ -40,11 +49,36 @@ and teach-back checklist. The [Stage 3](docs/stages/03-delivery-pipeline.md),
 - delivery/attempt claim leases, abandonment, and stale-finalizer fencing;
 - terminal dead-letter timestamp/reason before broker ACK;
 - authenticated `202` manual replay with a new generation and outbox UUID;
+- endpoint creation that rejects unsafe URL/DNS answers before persistence;
+- connection-time resolution of every A/AAAA answer, non-global/metadata and
+  special-address rejection, numeric-IP connection pinning, and peer-IP
+  verification while retaining the original HTTP Host and TLS SNI name;
+- PostgreSQL-authoritative per-endpoint fixed-window limiting and persistent
+  closed/open/half-open circuit state with one leased recovery probe;
+- rate/circuit deferrals that persist `retry_scheduled` due time and delayed
+  NAK without creating an HTTP attempt or spending attempt budget;
+- tenant-scoped, optimistic signing-secret rotation that retains older
+  versions for already accepted delivery snapshots;
 - unchanged strict schema-v1 ID-only broker envelopes, with dispatch generation
   derived from the reconciled PostgreSQL outbox row;
+- non-root application containers with a read-only root filesystem, all Linux
+  capabilities dropped, no-new-privileges, a bounded PID count, and a small
+  hardened `/tmp` tmpfs;
 - a configurable local receiver retaining bounded exact-byte/header evidence.
 
-Default recovery policy:
+Default Stage 5 policy additions:
+
+| Setting | Default |
+| --- | --- |
+| Maximum HTTP request body | 1,048,576 bytes |
+| Maximum canonical event payload | 262,144 bytes |
+| DNS timeout | 2 seconds |
+| Per-endpoint fixed-window allowance | 10 requests / 1 second |
+| Circuit transient-failure threshold | 5 |
+| Circuit cooldown | 30 seconds |
+| Local/test private-host exemptions | `receiver`, `127.0.0.1`, `localhost` |
+
+The Stage 4 recovery defaults remain:
 
 | Setting | Default |
 | --- | --- |
@@ -81,12 +115,24 @@ should wait until Stage 4 worker cutover completes: an old Stage 3 worker can
 parse the message but lacks generation fencing and may send an extra stale
 request.
 
-Outbound execution is still restricted to controlled `local`/`test` targets.
-Workers use an explicit hostname allowlist, disable redirects, and ignore
-environment proxies. A blocked target is persisted as dead-lettered with reason
-`target_blocked` and ACKed; replay can recover it after a reviewed configuration
-change. This is not complete SSRF protection. Stage 5 owns DNS/IP/rebinding and
-egress defenses, rate limiting, circuit breaking, size policy, and secret
+Stage 5 validates public destinations both when an endpoint is created and when
+the worker opens each connection. It validates every DNS answer, connects to a
+selected validated numeric IP, verifies the peer, disables redirects and
+environment proxies, and never opens Unix-domain destination sockets. Exact
+private-host exemptions exist only for controlled `local`/`test` demos;
+staging/production reject any non-empty exemption set and require HTTPS.
+
+This is application-layer SSRF protection, not a complete production network
+boundary. A deployment still needs deny-by-default egress/firewall rules,
+metadata-service controls, trusted DNS, ingress TLS, secret management,
+monitoring, and incident procedures. The fixed-window limiter also permits a
+boundary burst and is not a tenant billing quota or capacity proof.
+
+Endpoint signing-secret rotation is snapshot-safe: old encrypted rows remain
+available to deliveries accepted before rotation, while new events select the
+new active version. The process currently loads only one master AES key/version;
+changing that key without a separate re-encryption/key-ring procedure makes
+retained ciphertext undecryptable. Endpoint rotation is not master-key
 rotation.
 
 Stage 6 owns full history/attempt APIs, observability, dashboards, and the
@@ -104,6 +150,7 @@ is reproducible persistence, not HA, backup, or disaster recovery.
 | `GET /v1/tenant` | tenant API key | `200`; authenticated tenant metadata |
 | `POST /v1/endpoints` | tenant API key | `201`; endpoint and one-time signing secret |
 | `GET /v1/endpoints/{endpoint_id}` | tenant API key | `200`; secret-free tenant metadata |
+| `POST /v1/endpoints/{endpoint_id}/signing-secret/rotate` | tenant API key + JSON expected version | `200`; new version and one-time signing secret |
 | `POST /v1/events` | tenant key + `Idempotency-Key` | `201`; event/deliveries/outbox committed |
 | `GET /v1/events/{event_id}` | tenant API key | `200`; current state, generation, due time, and terminal reason |
 | `POST /v1/deliveries/{delivery_id}/replay` | tenant API key + JSON expected generation | `202`; dead-lettered delivery reset to a fresh pending generation |
@@ -115,6 +162,18 @@ Replay requires
 delivery not currently dead-lettered returns `409 delivery_not_replayable`.
 `202` proves PostgreSQL committed the new generation and outbox intent, not
 broker publication or receiver success.
+
+Secret rotation requires `{"expected_active_version": <observed positive
+version>}`. A stale value returns `409 signing_secret_version_conflict` and the
+safe `HookRelay-Active-Secret-Version` response header; missing/cross-tenant
+endpoint IDs remain opaque `404`. Successful plaintext is returned once with
+`Cache-Control: no-store` and `Pragma: no-cache`.
+
+Any HTTP body larger than `HOOKRELAY_MAX_REQUEST_BODY_BYTES` receives
+`413 request_body_too_large` before routing, authentication, or JSON parsing.
+An otherwise valid event whose compact sorted-key UTF-8 `payload` exceeds
+`HOOKRELAY_MAX_EVENT_PAYLOAD_BYTES` receives `413 event_payload_too_large`
+before ingestion.
 
 The receiver is a local inspection tool, not a product API:
 
@@ -142,7 +201,7 @@ Python dependency graph.
 Windows PowerShell:
 
 ```powershell
-git clone --branch codex/stage-04-failure-recovery --single-branch https://github.com/clashing13/hookrelay.git
+git clone --branch codex/stage-05-security-traffic-control --single-branch https://github.com/clashing13/hookrelay.git
 Set-Location hookrelay
 Copy-Item .env.example .env
 ```
@@ -229,9 +288,10 @@ Invoke-RestMethod `
   -Headers $authHeaders
 ```
 
-The Stage 4 guide contains exact demonstrations for transient recovery,
-permanent dead letter, authenticated replay, and a safe local worker kill:
-[run and test Stage 4](docs/stages/04-failure-recovery.md#10-exact-commands-for-running-and-testing).
+The Stage 5 guide contains exact demonstrations for destination blocking,
+request limits, endpoint throttling, circuit recovery, secret rotation, and
+container permissions:
+[run and test Stage 5](docs/stages/05-security-traffic-control.md#10-exact-commands-for-running-and-testing).
 
 Stop containers while preserving PostgreSQL and NATS data:
 
@@ -344,7 +404,7 @@ $env:HOOKRELAY_TEST_NATS_URL = "nats://127.0.0.1:4222"
 .\.venv\Scripts\pytest.exe -m concurrency
 .\.venv\Scripts\alembic.exe check
 docker compose config --quiet
-docker build --pull --tag hookrelay:stage4 .
+docker build --pull --tag hookrelay:stage5 .
 ```
 
 Stopping long-lived application processes prevents them from claiming rows
@@ -352,11 +412,17 @@ created by deterministic integration harnesses. The commands create or reuse
 only the explicitly named `hookrelay_test`; they never point tests at the normal
 `POSTGRES_DB` or drop a database. Reserve `hookrelay_test` for disposable test
 data and stop if it contains anything valuable.
-At the Stage 4 checkpoint, the complete suite passed all 143 tests. Its twelve
-Stage 4 real-service scenarios include fresh database-clock behavior after a row
-lock wait and a worker subprocess killed after receiver capture with successful
-replacement recovery. That proves the encoded schedules, not every process-kill
-timing, exactly once, Stage 5 hostile-network safety, HA, or production capacity.
+Stage 5-focused evidence lives in
+`tests/unit/test_stage5_security.py`,
+`tests/unit/test_stage5_traffic_control.py`,
+`tests/api/test_stage5_security.py`,
+`tests/integration/test_stage5_security.py`, and
+`tests/integration/test_stage5_traffic_control.py`. It covers address classes,
+mixed DNS answers, IP-pinned peer/Host/SNI behavior, byte boundaries,
+tenant-safe rotation, shared concurrent fixed-window admission, and one leased
+recovery probe against real PostgreSQL. Those tests prove their encoded cases,
+not arbitrary DNS/resolver compromise, external egress policy, every race,
+exactly once, HA, or production capacity.
 
 ## Migration policy
 
@@ -367,6 +433,10 @@ startup.
 - `20260803_0002`: recoverable outbox publisher claims.
 - `20260804_0003`: retry schedule, delivery claim lease, generation, dead-letter
   state/reason, attempt fencing, and per-generation outbox uniqueness.
+- `20260805_0004`: one persistent, composite tenant/endpoint traffic-control
+  row, fixed-window counters, circuit state, and recovery-probe lease fields;
+  upgrade backfills existing endpoints and adds `is_circuit_probe` attempt
+  evidence.
 
 The Stage 4 upgrade converts any pre-existing unfinished Stage 3 attempts to
 `abandoned` and schedules their deliveries immediately. Downgrade intentionally
@@ -384,7 +454,14 @@ review both artifacts and run `alembic check`.
 - [Stage 2: durable event ingestion](docs/stages/02-event-ingestion.md)
 - [Stage 3: durable delivery pipeline](docs/stages/03-delivery-pipeline.md)
 - [Stage 4: failure recovery](docs/stages/04-failure-recovery.md)
+- [Stage 5: security and traffic control](docs/stages/05-security-traffic-control.md)
 - [Architecture decision records](docs/decisions/README.md)
+- Stage 5 decisions:
+  [resolved-address SSRF](docs/decisions/0014-resolved-address-ssrf-policy.md),
+  [database-authoritative traffic controls](docs/decisions/0015-database-authoritative-endpoint-traffic-controls.md),
+  [pre-parse request limits](docs/decisions/0016-request-byte-limits-before-parsing.md),
+  [versioned secret rotation](docs/decisions/0017-versioned-signing-secret-rotation.md), and
+  [least-privilege app containers](docs/decisions/0018-least-privilege-app-containers.md)
 
 ## License
 

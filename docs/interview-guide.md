@@ -4,61 +4,75 @@ This guide turns the implemented system into precise interview explanations.
 Lead with an invariant and evidence, then state the boundary. Avoid reciting a
 tool list or claiming roadmap behavior as complete.
 
-## Thirty-second Stage 4 pitch
+## Thirty-second Stage 5 pitch
 
-> HookRelay `0.4.0` accepts events idempotently and commits dispatch intent in
-> PostgreSQL before an outbox publisher sends an ID-only command through NATS
-> JetStream to a bounded signed-webhook worker. PostgreSQL owns retry due time,
-> exponential backoff with jitter, a five-attempt generation budget, expiring
-> worker claims, and terminal dead-letter reasons. The worker persists a retry
-> or terminal decision before delayed NAK or ACK. An authenticated replay creates
-> a fresh outbox UUID and generation without erasing attempts. It remains at
-> least once; Stage 5 still owns full SSRF, rate, and circuit controls.
+> HookRelay `0.5.0` accepts tenant-authenticated, byte-bounded events
+> idempotently and commits dispatch intent in PostgreSQL before publishing an
+> ID-only command through NATS JetStream. PostgreSQL owns retry timing, attempt
+> leases, per-endpoint fixed-window admission, circuit state, and a fenced
+> single recovery probe. Endpoint creation rejects unsafe destinations, while
+> each outbound connection re-resolves, validates, pins, and verifies its peer.
+> Signing-secret rotation preserves delivery snapshots. The system remains at
+> least once, and its application controls do not replace production egress,
+> quota, capacity, or key-management controls.
 
 ## Ninety-second architecture answer
 
 1. Stage 1 created the FastAPI lifecycle, validated configuration, separate
    liveness/readiness probes, process-scoped async engine, explicit Alembic
    boundary, Compose topology, and layered tests.
-2. A deployment-only bootstrap route creates a tenant and one raw API key. The
+2. A bounded ASGI layer counts actual request-body bytes before routing,
+   authentication, or JSON parsing; event ingestion also caps the compact
+   validated payload.
+3. A deployment-only bootstrap route creates a tenant and one raw API key. The
    raw key is returned once; only its public ID, SHA-256 secret digest, and hint
    are stored.
-3. Tenant routes authenticate bearer keys and derive the tenant internally.
+4. Tenant routes authenticate bearer keys and derive the tenant internally.
    Callers never choose a tenant ID.
-4. Endpoint creation generates a signing secret, encrypts it with AES-256-GCM,
-   and returns it once. The worker recovers the exact snapshotted version to
-   sign HTTP.
-5. Event submission requires an idempotency header. HookRelay hashes a
+5. Endpoint creation validates the URL and, for non-exempt public destinations,
+   every resolved address before persistence. It generates an
+   AES-256-GCM-encrypted signing secret and returns it once. Optimistically
+   locked rotation retires that version and returns a replacement once;
+   existing deliveries retain their secret-row snapshots.
+6. Event submission requires an idempotency header. HookRelay hashes a
    canonical versioned request and uses a tenant/key unique constraint plus
    PostgreSQL `ON CONFLICT` to make retries safe across concurrent API replicas.
-6. The successful transaction creates one event, one pending delivery per
+7. The successful transaction creates one event, one pending delivery per
    endpoint, and one generation-1 outbox row per delivery. Only after commit
    does the route return `201`.
-7. A separate publisher leases eligible outbox rows in short PostgreSQL
+8. A separate publisher leases eligible outbox rows in short PostgreSQL
    transactions, publishes ID-only commands to a file-backed JetStream stream,
    waits for PubAck, then conditionally records `published_at`.
-8. Workers share a durable pull consumer and bound concurrency with a fetch
+9. Workers share a durable pull consumer and bound concurrency with a fetch
    window, semaphore, HTTP pool, and broker `MaxAckPending`.
-9. A worker reconciles the broker message with its exact PostgreSQL outbox row,
-   derives dispatch generation there, and claims an attempt with a token and
-   database-time expiry before timeout-bounded HTTP.
-10. Success commits before ACK. Transient failure commits a capped
+10. A worker reconciles the exact outbox row and locks the endpoint's traffic
+    row. Rate denial, an open circuit, or another half-open probe schedules a
+    database-time deferral without creating an attempt or spending retry budget.
+11. Admitted work claims an attempt with a token and expiry. Each new outbound
+    connection re-resolves all addresses, rejects unsafe answers, connects to a
+    validated numeric IP, preserves the original host for HTTP/TLS, and verifies
+    the peer; redirects, environment proxies, and Unix sockets are disabled.
+12. Success commits before ACK. Transient failure commits a capped
     exponential/jittered due time before delayed NAK; permanent, exhausted, or
     policy-blocked work commits a dead letter before ACK.
-11. An expired worker claim becomes an abandoned attempt and is scheduled or
+13. An expired worker claim becomes an abandoned attempt and is scheduled or
     dead-lettered. Token/generation/expiry checks fence late finalizers.
-12. Authenticated manual replay increments generation and creates a fresh
+14. Authenticated manual replay increments generation and creates a fresh
     outbox UUID in one transaction. The unchanged schema-v1 broker envelope
     remains ID-only; old-generation fencing comes from the reconciled outbox
     row. The guarantee remains at least once.
+15. HookRelay's own containers run non-root with read-only filesystems, dropped
+    capabilities, `no-new-privileges`, PID ceilings, and restricted `/tmp`; the
+    PostgreSQL and NATS images retain service-specific profiles.
 
 ## Whiteboard trace
 
-Draw the current boundary and keep later roadmap controls outside it:
+Draw the current boundary and keep external production controls outside it:
 
 ```text
 Producer
-  -> FastAPI: validate JSON + headers
+  -> ASGI: count actual body bytes -> 413 if over configured maximum
+  -> FastAPI: validate JSON + headers + compact event payload size
   -> API-key lookup/digest verification -> tenant context
   -> canonical request fingerprint
   -> tenant-scoped endpoint/secret lookup
@@ -70,8 +84,11 @@ Producer
   -> 201 Created
   -> outbox lease -> JetStream PubAck -> published_at
   -> durable pull consumer -> bounded worker
+  -> PostgreSQL endpoint traffic row
+       -> rate/circuit/probe deferral -> due time + delayed NAK, no attempt
   -> attempt + delivering claim/lease commit
-  -> timestamped exact-byte HMAC HTTP
+  -> DNS validate -> numeric-IP connect -> peer verify
+  -> timestamped exact-byte HMAC HTTP (original Host + TLS identity)
        -> 2xx -> success commit -> ACK
        -> transient -> retry_scheduled + due time commit -> delayed NAK
        -> permanent/exhausted -> dead_lettered + reason commit -> ACK
@@ -80,8 +97,12 @@ Producer
 Operator -> POST /v1/deliveries/{id}/replay
          -> generation + 1 + fresh outbox UUID, one transaction -> 202
 
+Operator -> POST /v1/endpoints/{id}/signing-secret/rotate
+         -> expected active version -> retire old + create new -> 200
+
 Ambiguity: PubAck before outbox finalization; receiver action before
 HookRelay success certainty. Stable IDs + idempotency, not exactly once.
+Residual boundary: application SSRF checks still require external egress policy.
 ```
 
 ## Stage 1 foundation questions
@@ -242,6 +263,10 @@ HookRelay success certainty. Stable IDs + idempotency, not exactly once.
 - Composite foreign keys repeat tenant identity across relationships so the
   database rejects a cross-tenant event/API-key, delivery/endpoint, or
   delivery/secret association.
+- The Stage 5 endpoint traffic row is likewise keyed and constrained by
+  `(tenant_id, endpoint_id)`.
+- This is application scope plus relational integrity, not a claim that the
+  current schema uses PostgreSQL row-level security.
 - Application checks and database constraints are defense in depth, not
   interchangeable layers.
 
@@ -378,7 +403,7 @@ HookRelay success certainty. Stable IDs + idempotency, not exactly once.
   terminal transition.
 - A crash after attempt commit could leave `delivering` indefinitely.
 - Stage 4 replaces that historical boundary; do not describe the Stage 3
-  behavior as current `0.4.0` behavior.
+  behavior as current Stage 4 or Stage 5 behavior.
 
 ## Stage 4 failure-recovery questions
 
@@ -468,26 +493,143 @@ HookRelay success certainty. Stable IDs + idempotency, not exactly once.
 - Success, already-success, dead-letter, and stale generation ACK after durable
   state.
 - Scheduled retry and active lease use delayed NAK.
-- A blocked target normally commits `target_blocked` and ACKs; a fixed delayed
-  NAK is only the pre-persistence fallback.
+- Stage 5 URL-policy rejection commits `target_blocked` before an attempt;
+  connection-time DNS or peer rejection records the already-claimed attempt.
+  Both ACK only after terminal state commits.
 - A stale worker that loses its claim performs no broker action from its old
   handle.
 
+## Stage 5 security and traffic-control questions
+
+### How does destination validation address DNS rebinding?
+
+- Endpoint creation accepts only HTTP(S), rejects credentials/fragments, and
+  requires HTTPS in staging/production. Public hostnames must resolve, and
+  every A/AAAA answer must be safe before the endpoint is persisted.
+- That lookup is not reused as authorization. For every new connection the
+  worker resolves again with a bounded timeout and answer count, rejects any
+  unsafe or mixed answer set, and chooses one validated numeric IP.
+- It connects to that IP, preserves the original hostname for `Host` and TLS
+  SNI/certificate checks, and verifies that the actual peer is the selected IP.
+- Redirects and environment proxies are disabled, connection reuse is disabled,
+  and Unix-domain transports are forbidden, so those paths cannot bypass the
+  per-connection decision.
+
+### Which addresses are rejected, and what is still outside the guarantee?
+
+- Non-global, private, loopback, link-local, multicast, reserved, unspecified,
+  mapped-IPv6, metadata, deprecated IPv4 transition `192.88.99.0/24`, NAT64,
+  Teredo, ORCHIDv2, and 6to4 destinations are rejected.
+- Exact `delivery_allowed_hosts` exemptions support controlled local/test
+  receivers. They skip creation-time DNS preflight but still resolve and pin at
+  connection time; staging/production require the exemption list to be empty.
+- These are application-layer controls. Production must still restrict DNS and
+  network egress with firewall/orchestrator policy and monitor that boundary.
+
+### Why store rate and circuit state in PostgreSQL?
+
+- A process-local counter or breaker would multiply with every worker replica
+  and forget state on restart.
+- Each endpoint has one `(tenant_id, endpoint_id)` traffic-control row. A row
+  lock plus a fresh PostgreSQL time read after any lock wait serializes the
+  fixed window, circuit transition, and recovery-probe lease across workers.
+- The endpoint creation transaction and Stage 5 migration both ensure the row
+  exists; composite ownership keeps it inside the tenant boundary.
+- This design chooses shared correctness and inspectability over the latency of
+  a purely in-memory limiter.
+
+### When does a traffic-control deferral spend an attempt?
+
+- Never. A full fixed window, an open circuit still in cooldown, or a competing
+  half-open probe moves the delivery to `retry_scheduled` with a database due
+  time before any attempt row, retry budget, or outbound socket exists.
+- The worker then sends a delayed NAK. PostgreSQL remains authoritative if that
+  wake-up is early, late, or lost.
+- The default fixed window is 10 admitted requests per endpoint per one second;
+  it is intentionally a simple burst control, not a tenant quota or proof of
+  production capacity.
+
+### How is exactly one half-open recovery probe enforced?
+
+- After the default 30-second cooldown, the locked traffic row grants one
+  probe token/expiry fenced to the delivery's claim. Competing workers observe
+  the probe and defer without an attempt.
+- The probe consumes a normal rate-limit slot. Success closes and resets the
+  circuit; a transient failure or abandoned probe reopens it for another full
+  cooldown. Permanent or policy-blocked outcomes close/reset it because retrying
+  that same destination condition is not the circuit's job.
+- The default transient-failure threshold is five. The circuit reduces futile
+  traffic; it does not promise endpoint health or eliminate all concurrency.
+
+### How is signing-secret rotation snapshot-safe?
+
+- `POST /v1/endpoints/{id}/signing-secret/rotate` takes
+  `{"expected_active_version": N}` and locks the tenant-owned endpoint and
+  active secret.
+- One request atomically retires the old row using database time and inserts
+  version `N + 1`; it returns the replacement plaintext once with `200` and
+  `Cache-Control: no-store` plus `Pragma: no-cache`.
+- A stale writer receives `409 signing_secret_version_conflict` and
+  `HookRelay-Active-Secret-Version`; missing and cross-tenant IDs share opaque
+  `404` behavior.
+- Old deliveries keep their signing-secret row ID, while events accepted after
+  rotation snapshot the new row. Retention is what preserves retry and replay
+  correctness.
+
+### Does endpoint-secret rotation rotate the encryption master key?
+
+- No. Endpoint rotation creates a new encrypted endpoint secret under the
+  configured AES master key/version.
+- The current runtime loads only one master key. Replacing it without first
+  rewrapping retained rows, or without a keyring capable of old versions, makes
+  those delivery snapshots undecryptable.
+- Key custody, rotation, audit, backup, and restore remain deployment concerns.
+
+### Where are request and payload sizes enforced?
+
+- ASGI middleware counts actual streamed body bytes, treating
+  `Content-Length` only as an early hint. A single all-digit value is compared
+  without parsing an unbounded integer; a declared overage receives immediate
+  `413`, while duplicate/malformed hints still fall through to streamed-byte
+  counting. More than the default 1 MiB receives `413` before routing,
+  authentication, or JSON parsing.
+- Event ingestion then measures compact, sorted-key UTF-8 bytes after Pydantic
+  validation and rejects a payload above the default 256 KiB with `413`.
+- The settings are bounded and cross-validated, but neither limit is a tenant
+  storage quota or a substitute for an ingress limit.
+
+### What does least privilege mean for the Compose application containers?
+
+- API, publisher, worker, and receiver run as UID/GID `10001:10001` with
+  root-owned code and migrations, a read-only root filesystem, all capabilities
+  dropped, `no-new-privileges`, a 256-PID ceiling, and a 16 MiB `/tmp` tmpfs
+  mounted `noexec,nosuid,nodev`.
+- PostgreSQL and NATS keep image-appropriate permissions instead of inheriting
+  an untested generic profile. Loopback-published ports still do not replace
+  deployment network policy.
+
+Primary references: the
+[Stage 5 guide](stages/05-security-traffic-control.md),
+[ADR 0014](decisions/0014-resolved-address-ssrf-policy.md),
+[ADR 0015](decisions/0015-database-authoritative-endpoint-traffic-controls.md),
+[ADR 0016](decisions/0016-request-byte-limits-before-parsing.md),
+[ADR 0017](decisions/0017-versioned-signing-secret-rotation.md), and
+[ADR 0018](decisions/0018-least-privilege-app-containers.md).
+
 ## Security and limitation questions
 
-### Does requiring `HttpUrl`, HTTPS, or the local/test allowlist solve SSRF?
+### Does requiring `HttpUrl` or HTTPS solve SSRF?
 
-- No. Schema validation accepts only HTTP(S) syntax and rejects
-  userinfo/fragments. The endpoint API additionally requires HTTPS in
-  staging/production, while delivery workers refuse to run there at
-  all.
-- The current worker restricts execution to local/test, requires an explicit
-  hostname allowlist, disables redirects, and ignores environment proxies. A
-  blocked target becomes replayable terminal `target_blocked` state.
-- Complete SSRF defense must still handle loopback/private/link-local/metadata
-  IPs, DNS resolution/rebinding, IPv6, and network egress policy.
-- The current gate permits a controlled local receiver; it is not safe
-  arbitrary-destination production delivery. Stage 5 owns that boundary.
+- No. Syntax and TLS-scheme checks alone say nothing about where DNS resolves or
+  which peer receives the connection.
+- Stage 5 additionally rejects unsafe literal/resolved IPs at creation,
+  re-resolves and validates all answers on every new connection, pins a chosen
+  numeric IP, checks the connected peer, preserves hostname TLS validation, and
+  disables redirects, environment proxies, connection reuse, and Unix sockets.
+- Exact private-host exemptions are local/test only; staging/production require
+  the exemption list to be empty.
+- Application validation still cannot replace external DNS and egress policy,
+  so do not describe it as complete infrastructure isolation.
 
 ### Is producer traffic protected by TLS?
 
@@ -500,12 +642,13 @@ HookRelay success certainty. Stable IDs + idempotency, not exactly once.
 
 ### Is request size bounded?
 
+- Yes. Actual streamed request bodies are capped at 1 MiB by default before
+  routing/parsing, and compact validated event payloads are capped at 256 KiB.
+  Both oversize paths return `413`.
 - Individual names, types, URLs, endpoint count, key grammar, and top-level body
-  shapes are bounded.
-- There is no explicit whole-request byte cap or tenant payload/storage quota
-  through Stage 4.
-- A production design needs ingress and application limits, rate limits, and
-  clear `413`/quota contracts before accepting hostile traffic.
+  shapes remain separately bounded.
+- There is still no tenant storage quota or production capacity claim; an
+  external ingress should enforce its own limit too.
 
 ### Does encryption at rest make secret storage complete?
 
@@ -514,10 +657,42 @@ HookRelay success certainty. Stable IDs + idempotency, not exactly once.
   backup, restore, and incident-recovery procedures.
 - The checked-in local key is intentionally not a production key, and settings
   reject it in staging/production.
+- Endpoint signing-secret rotation does not rotate that master key. The current
+  one-key runtime needs a deliberate rewrap/keyring workflow before an old key
+  can be retired without breaking retained delivery snapshots.
 - Memory, logs, client handling, and authorized application access remain part
   of the threat model.
 
 ## Test-evidence questions
+
+### How do you know Stage 5 works?
+
+Name the evidence and the boundary it crosses:
+
+- `tests/unit/test_stage5_security.py` covers address classification, bounded
+  all-answer DNS policy, numeric-IP connection pinning, original Host/SNI,
+  peer verification, no connection reuse, and safe error mapping.
+- `tests/unit/test_stage5_traffic_control.py` drives deterministic fixed-window,
+  circuit, probe-lease, expiry, and outcome transitions.
+- `tests/api/test_stage5_security.py` exercises actual-stream and canonical
+  payload caps, secret-rotation HTTP contracts, cross-tenant opacity, and
+  blocked literal endpoint creation.
+- `tests/integration/test_stage5_security.py` uses real PostgreSQL for
+  traffic-row creation, immutable secret snapshots, concurrent rotation, and
+  cross-tenant non-mutation.
+- `tests/integration/test_stage5_traffic_control.py` uses concurrent workers and
+  real PostgreSQL to show one shared fixed-window limit and exactly one leased
+  recovery probe.
+- Migration `20260805_0004` creates and backfills traffic rows and adds
+  `is_circuit_probe` attempt evidence; migration tests and `alembic check` cover
+  schema/model alignment. Compose/image checks cover the declared
+  non-root/read-only application profile.
+
+Then state the limit: constructed DNS/network doubles establish deterministic
+policy behavior but are not an external egress audit; one PostgreSQL concurrency
+schedule is not a throughput, fairness, HA, or capacity benchmark; container
+configuration checks do not prove host isolation; and the system remains at
+least once.
 
 ### How do you know Stage 4 works?
 
@@ -560,9 +735,9 @@ Name evidence by boundary:
 - Migrations/packaging: upgrade/downgrade/re-upgrade, `alembic check`, Compose
   validation, and Linux image build.
 
-Then state its historical limit: Stage 3 evidence did not prove the Stage 4
-retry/recovery policy, exactly once, Stage 5 hostile-network safety, clustered
-HA, or production throughput.
+Then state its historical limit: Stage 3 evidence did not prove the later Stage
+4 retry/recovery policy, the Stage 5 address/traffic controls, exactly once,
+clustered HA, production egress isolation, or production throughput.
 
 ### How do you know Stage 2 works?
 
@@ -592,6 +767,11 @@ defense, broker behavior, or receiver compatibility.
 
 ### What is a valuable safe failure demonstration?
 
+- Try to create an endpoint for `http://169.254.169.254/` and observe a
+  `422 destination_not_allowed` with no endpoint or secret row persisted.
+- Send more requests than the fixed-window allowance to a controlled endpoint
+  and show that excess deliveries receive a durable due time without an attempt
+  row; repeat with a tripped circuit and its single recovery probe.
 - Configure only the local receiver to return `503` and observe a transient
   attempt plus a persistent due time before delayed NAK.
 - Restore `204` and observe later success without creating unbounded work.
@@ -627,6 +807,8 @@ Contrast credential storage:
 - encrypt signing secrets because later HMAC generation needs recovery;
 - bind AES-GCM ciphertext to row context with AAD;
 - return both raw values only once;
+- rotate endpoint-secret rows without rewriting accepted delivery snapshots;
+- distinguish that operation from unsupported one-key master-key rotation; and
 - identify key management and TLS as remaining operational dependencies.
 
 ### “Tell me about a failure you tested.”
@@ -649,8 +831,15 @@ Use one concrete loop:
   budget, and a stale token cannot finalize over the recovered owner.
 - **Permanent/exhausted work:** a durable dead-letter reason commits before
   broker ACK.
-- **Policy block:** `target_blocked` commits without an HTTP attempt, then ACKs;
-  replay is available after a reviewed allowlist fix.
+- **Policy block:** a URL rejected before traffic admission commits
+  `target_blocked` without an attempt; a connection-time DNS/peer block records
+  the claimed attempt. Replay remains available after a reviewed policy fix.
+- **Traffic pressure:** concurrent workers share one endpoint row, and rate or
+  open-circuit deferral consumes neither attempt evidence nor retry budget.
+- **Circuit recovery:** after cooldown, one worker owns the fenced probe while
+  competitors defer; transient probe failure reopens the circuit.
+- **Secret rotation:** concurrent expected-version requests produce one winner,
+  while older deliveries continue to reference their original secret row.
 - **Replay:** expected generation, tenant scope, and row locking produce one
   fresh outbox UUID without erasing earlier attempts.
 - **Real process death:** kill a separate worker after receiver capture, then
@@ -661,12 +850,12 @@ For each, say what was observed and one thing the exercise cannot prove.
 
 ### “What would you build next?”
 
-Stage 5 should replace the local/test hostname gate with complete
-DNS/IP/rebinding/egress SSRF controls, add per-endpoint rate limiting and
-circuit breaking, define size limits, and design secret rotation. Stage 6 then
-adds telemetry, history APIs, and the operations console. Stage 7 should expand
-the single Stage 4 subprocess-kill schedule into a broader fault matrix and add
-load, soak, HA, and capacity evidence.
+Stage 6 should add telemetry, history APIs, and the operations console without
+weakening the tenant and secret-redaction boundaries. Stage 7 should expand the
+single Stage 4 subprocess-kill schedule into a broader DNS/TLS/process fault
+matrix and add load, soak, HA, fairness, and capacity evidence. Production work
+also needs external egress policy, ingress/tenant quotas, and a safe master-key
+keyring/rewrap lifecycle; Stage 5 intentionally does not claim those outcomes.
 
 ## Claims to avoid
 
@@ -703,12 +892,38 @@ load, soak, HA, and capacity evidence.
 - “Keeping broker schema v1 makes mixed old/new workers fully safe for replay.”
 - “A fixture with an expired lease proves OS-level worker-kill recovery.”
 - “The hostname allowlist is complete SSRF protection.”
+- “Application DNS/IP validation makes an external egress policy unnecessary.”
+- “A fixed-window limiter is a tenant quota or production capacity guarantee.”
+- “A traffic-control deferral is an HTTP attempt.”
+- “Endpoint signing-secret rotation also rotates the AES master key.”
+- “Non-root and read-only containers are a complete security boundary.”
 - “HMAC encrypts the webhook body.”
 - “A timestamp alone prevents replay.”
 - “Async means the worker has unlimited concurrency.”
 - “The happy-path test proves production scale.”
 
-## Three-to-five-minute Stage 4 teach-back
+## Three-to-five-minute Stage 5 teach-back
+
+Aim for this timing:
+
+1. **0:00-0:35 — Boundary:** Stage 5 adds ingress, destination, traffic,
+   rotation, and container controls while at-least-once delivery remains.
+2. **0:35-1:15 — Ingress and tenant:** actual-stream 1 MiB cap, canonical
+   256 KiB payload cap, bearer-derived tenant, opaque lookup behavior.
+3. **1:15-2:05 — Destination:** creation preflight, all-answer classification,
+   per-connection re-resolution, numeric-IP pinning, peer/Host/TLS checks, and
+   why external egress policy remains required.
+4. **2:05-3:00 — Traffic:** PostgreSQL fixed window and circuit state, no-attempt
+   deferrals, cooldown, and exactly one fenced half-open probe.
+5. **3:00-3:45 — Rotation:** expected active version, row locks, immutable
+   delivery snapshots, one-time response, and the one-master-key limitation.
+6. **3:45-4:25 — Runtime:** non-root/read-only app containers and why official
+   database/broker images need service-specific profiles.
+7. **4:25-5:00 — Evidence/boundaries:** name the five Stage 5 test files and
+   migration `20260805_0004`; deny exactly-once, egress-isolation, quota, scale,
+   and production-security claims.
+
+## Historical Stage 4 teach-back
 
 Aim for this timing:
 
@@ -725,7 +940,8 @@ Aim for this timing:
 6. **3:35-4:20 — Compatibility:** unchanged ID-only schema v1, generation from
    the reconciled outbox row, stale suppression, and worker-cutover caveat.
 7. **4:20-5:00 — Evidence/boundaries:** distinguish unit, database, real
-   service, and hard-process-kill evidence; Stage 5 security remains.
+   service, and hard-process-kill evidence; at that checkpoint Stage 5 security
+   work was still pending.
 
 If any sentence depends on “FastAPI handles it” or “the database guarantees it”
 without naming the route, transaction, constraint, or test, trace one concrete

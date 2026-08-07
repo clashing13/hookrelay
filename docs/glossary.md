@@ -1,6 +1,6 @@
 # HookRelay glossary
 
-This glossary is cumulative through Stage 4 (`0.4.0`). Entries marked
+This glossary is cumulative through Stage 5 (`0.5.0`). Entries marked
 **future** describe planned behavior, not a capability of the current
 repository.
 
@@ -16,7 +16,8 @@ attempted, acknowledged, or delivered; those are later asynchronous states.
 
 A contract through which software communicates. HookRelay exposes health,
 protected bootstrap, authenticated tenant/endpoint inspection, endpoint
-creation, and idempotent event submission routes.
+creation/signing-secret rotation, idempotent event submission, delivery replay,
+and health routes.
 
 **Application factory**
 
@@ -81,7 +82,15 @@ avoid revealing whether another tenant's identifier exists.
 **HTTP `409 Conflict`**
 
 Used when a tenant reuses an `Idempotency-Key` for a different versioned request
-fingerprint. No second event is created.
+fingerprint, submits a stale signing-secret version during rotation, submits a
+stale replay generation, or tries to replay a non-dead-lettered delivery. No
+second event/rotation/generation is silently created.
+
+**HTTP `413 Content Too Large`**
+
+Used when actual ASGI request-body bytes exceed the configured whole-request
+limit or a validated event's canonical UTF-8 payload exceeds its smaller event
+limit. `Content-Length` is only an early hint; streamed bytes are authoritative.
 
 **HTTP `415 Unsupported Media Type`**
 
@@ -124,7 +133,8 @@ resources and dispose the database engine during graceful shutdown.
 
 A response that is the only API opportunity to capture raw credential material.
 Tenant bootstrap returns the initial API key once; endpoint creation returns
-the signing secret once. Both responses carry no-store headers.
+the first signing secret once; endpoint rotation returns the replacement once.
+All carry no-store headers. Later inspection returns metadata, not plaintext.
 
 **OpenAPI**
 
@@ -199,7 +209,16 @@ finished as succeeded, transient, permanent, or abandoned.
 
 A generated `whsec_...` value the delivery worker recovers to authenticate
 webhook requests with an HMAC. Unlike an API key, it must be recoverable, so it
-is encrypted rather than irreversibly hashed.
+is encrypted rather than irreversibly hashed. Stage 5 can atomically retire the
+active version and return a new version once; retained delivery snapshots keep
+referencing their original encrypted row.
+
+**Endpoint traffic-control row**
+
+The PostgreSQL row keyed by `(tenant_id, endpoint_id)` that holds one endpoint's
+fixed-window counter, circuit state/failure count/open time, and optional probe
+token/expiry. Locking it makes admission shared across worker processes rather
+than multiplying limits per process.
 
 **Event**
 
@@ -221,8 +240,9 @@ payloads while requiring their top-level value to be an object.
 
 An ordered, reviewable schema transition. Stage 2 creates the domain schema;
 Stage 3 adds recoverable outbox claims; Stage 4 revision `20260804_0003` adds
-retry, delivery-claim, generation, terminal, and replay state. Editing an ORM
-model does not update a database.
+retry, delivery-claim, generation, terminal, and replay state; Stage 5 revision
+`20260805_0004` creates/backfills per-endpoint traffic-control rows and adds
+probe evidence to attempts. Editing an ORM model does not update a database.
 
 **Outbox message**
 
@@ -262,7 +282,10 @@ not silently rewrite historical intent.
 **Tenant**
 
 HookRelay's customer isolation boundary. Tenant identity is derived from a
-verified API key, not accepted from a request body or query parameter.
+verified API key, not accepted from a request body or query parameter. Resource
+queries carry tenant predicates, missing and cross-tenant identifiers share
+opaque responses, and composite foreign keys protect relational ownership.
+The current schema does not claim PostgreSQL row-level security.
 
 **Transaction**
 
@@ -277,10 +300,11 @@ guard across all API replicas.
 
 **Webhook endpoint**
 
-A tenant-owned destination name and URL. Through Stage 4, outbound HTTP runs
-only for explicit local/test allowlist targets; blocked work becomes replayable
-terminal state. Full production SSRF controls arrive in Stage 5. The current
-`enabled` response field maps to stored active state.
+A tenant-owned destination name and URL. Stage 5 validates it at creation and
+again through the worker's IP-pinned transport. Exact private-host exemptions
+exist only for local/test; blocked work becomes replayable `target_blocked`
+terminal state. The current `enabled` response field maps to stored active
+state.
 
 ## Idempotency and concurrency terms
 
@@ -341,6 +365,13 @@ generation a bounded retry budget. Missing/cross-tenant IDs use opaque `404`;
 a valid tenant-owned delivery outside `dead_lettered` returns
 `409 delivery_not_replayable`.
 
+**Signing-secret rotation precondition**
+
+The rotation request's `expected_active_version`. HookRelay compares it while
+holding the tenant-owned endpoint/active-secret lock. One concurrent request
+wins; a stale request receives `409 signing_secret_version_conflict` plus the
+safe current-version header, without retiring or inserting a row.
+
 ## Security and cryptography terms
 
 **AAD (Additional Authenticated Data)**
@@ -378,8 +409,10 @@ not the same as hashing.
 **Encryption-key version**
 
 Metadata identifying which configured key encrypted a secret. It makes a
-deliberate rotation/re-encryption workflow possible, but no rotation workflow
-is implemented through Stage 3.
+deliberate master-key rotation/re-encryption workflow possible. Stage 5 rotates
+endpoint signing-secret versions, not this master key. The current process
+loads one AES key/version, so replacing it without a keyring or rewrapping
+retained secret rows makes those snapshots undecryptable.
 
 **Entropy**
 
@@ -415,14 +448,41 @@ A Pydantic wrapper that reduces accidental secret display in representations
 and errors. Code can still deliberately reveal the value; it is not encryption,
 access control, or a secret manager.
 
-**SSRF (Server-Side Request Forgery)** — **complete defense is future**
+**DNS rebinding**
+
+Returning a safe address during validation and a different, unsafe address
+when the client connects. HookRelay does not trust the creation-time lookup as
+a connection authorization: each new connection resolves again, validates all
+answers, selects a validated numeric address, and verifies the connected peer.
+
+**Egress control**
+
+Network policy outside the application that restricts where a workload can
+connect. HookRelay's application checks reduce SSRF risk, but production still
+needs firewall, DNS, proxy, and orchestrator policy as an independent boundary.
+
+**IP pinning**
+
+Connecting to a validated numeric address while preserving the original
+hostname for the HTTP `Host` header and TLS SNI/certificate verification.
+HookRelay also confirms that the actual peer address is the selected address.
+
+**Local destination exemption**
+
+An exact hostname in `delivery_allowed_hosts` that permits a private local/test
+receiver. Exemptions skip endpoint-creation DNS preflight but are still
+resolved and pinned when a worker connects. Staging/production settings require
+this list to be empty.
+
+**SSRF (Server-Side Request Forgery)**
 
 Abusing a server's outbound fetch to reach unintended internal or privileged
-targets. Stage 4 still sends HTTP only in local/test, checks an explicit
-hostname allowlist, disables redirects, and ignores environment proxies. A
-blocked target becomes a replayable terminal delivery rather than executing.
-Those controls are not complete SSRF protection: resolved-IP classification,
-DNS rebinding, IPv6/special ranges, and egress controls remain Stage 5 work.
+targets. Stage 5 accepts only policy-compliant HTTP(S) URLs, requires HTTPS in
+staging/production, rejects unsafe literal or resolved addresses, repeats DNS
+validation at each new connection, pins the chosen IP, verifies the peer,
+preserves hostname TLS validation, disables redirects and environment proxies,
+and forbids Unix sockets. This is defense in depth, not a claim that application
+code replaces production egress controls.
 
 **TLS (Transport Layer Security)**
 
@@ -482,15 +542,22 @@ retry schedule; Stage 4 persists due time and uses explicit delayed NAK.
 **At-least-once delivery**
 
 A logical event may be attempted more than once so transient or ambiguous
-failures do not silently lose it. Stage 4 adds bounded retry and crash recovery
-but retains duplicate-publication/HTTP ambiguity; receiver idempotency remains
-required.
+failures do not silently lose it. Stages 4 and 5 provide bounded retry, crash
+recovery, and traffic admission but retain duplicate-publication/HTTP
+ambiguity; receiver idempotency remains required.
 
 **Bounded concurrency**
 
 A hard ceiling on simultaneous work. Stage 3 aligns a worker fetch window,
 `asyncio.Semaphore`, HTTP connection pool, and JetStream `MaxAckPending` rather
 than creating an unbounded task/socket backlog.
+
+**Circuit breaker**
+
+Per-endpoint PostgreSQL state that stops new attempts after repeated transient
+failures. `closed` admits normal work, `open` defers until its cooldown, and
+`half_open` admits exactly one fenced recovery probe. A success or permanent
+outcome closes/resets it; a transient or abandoned probe reopens it.
 
 **Canonical body bytes**
 
@@ -504,6 +571,14 @@ publisher commit ownership, release its database locks before broker I/O, and
 later finalize only while its token still matches. Expiry recovers abandoned
 claims. The TTL must exceed the configured sequential batch size multiplied by
 the per-publish timeout.
+
+**Fixed-window rate limit**
+
+A per-endpoint request counter and database-time window stored in PostgreSQL.
+Admission locks the endpoint traffic-control row and reads fresh database time
+after any lock wait, so concurrent workers share one default limit of 10
+requests per one second. It is a simple burst-control policy, not a production
+quota or capacity guarantee.
 
 **Dead letter**
 
@@ -548,16 +623,16 @@ the domain/retry source of truth.
 
 An internally malformed command or one whose identities contradict
 authoritative PostgreSQL state. The worker terminates it rather than performing
-HTTP. A destination blocked by the temporary outbound policy is valid domain
-work, not poison; Stage 4 persists a replayable `target_blocked` dead letter.
+HTTP. A destination blocked by the outbound destination policy is valid domain
+work, not poison; HookRelay persists a replayable `target_blocked` dead letter.
 
 **Policy-blocked delivery**
 
-Valid durable work whose destination is not permitted by the current local/test
-runtime and hostname gate. Stage 4 records terminal reason `target_blocked`
-without an HTTP attempt, ACKs after that commit, and permits manual replay after
-a reviewed policy/configuration change. A fixed delayed NAK remains only a
-fallback if the executor cannot persist the terminal decision.
+Valid durable work whose destination URL, DNS answers, or connected peer is not
+permitted by the current policy. A URL blocked before admission records
+terminal reason `target_blocked` without an attempt; a connection-time block is
+recorded on the already-claimed attempt. HookRelay ACKs after terminal state
+commits and permits manual replay after a reviewed policy/configuration change.
 
 **Publish acknowledgment (`PubAck`)**
 
@@ -568,6 +643,12 @@ The outbox publisher requires it before marking the PostgreSQL row published.
 
 A consumer whose client requests a bounded batch when it has capacity. Stage 3
 uses pull delivery to align broker flow with worker concurrency.
+
+**Recovery probe**
+
+The single attempt admitted after an open circuit's cooldown. Its probe token
+and expiry are fenced to the delivery claim; competing workers defer without
+creating attempts. The probe consumes a normal rate-limit slot.
 
 **Transactional outbox**
 
@@ -685,6 +766,13 @@ do not spend it.
 Persistent `retry_scheduled` delivery state plus a non-null PostgreSQL due time.
 It survives worker restarts independently of an individual delayed NAK.
 
+**Traffic deferral**
+
+A database-authoritative decision to postpone work because the fixed window is
+full, the circuit is cooling down, or another recovery probe owns admission.
+The delivery becomes `retry_scheduled` with a PostgreSQL due time and receives a
+delayed NAK; no attempt row, retry budget, or outbound socket is consumed.
+
 **Stale dispatch**
 
 A broker message whose exact outbox row belongs to an older dispatch generation
@@ -706,10 +794,19 @@ It catches some model/migration drift after the migration has been applied.
 
 **Integration test**
 
-A test crossing a real system boundary. Through Stage 4, integration coverage
+A test crossing a real system boundary. Through Stage 5, integration coverage
 uses PostgreSQL, NATS JetStream, and HTTP receiver behavior for migrations,
 claims, schedules, fencing, publication, attempts, dead letters, replay, and
-the delivery path.
+the delivery path, plus PostgreSQL-shared traffic control, rotation snapshots,
+and tenant isolation.
+
+**Least-privilege app container**
+
+An application container running as a non-root identity with a read-only root
+filesystem, all Linux capabilities dropped, `no-new-privileges`, a PID limit,
+and a small restricted `/tmp` tmpfs. HookRelay applies this shared profile to
+its own API, publisher, worker, and receiver services; it does not blindly
+apply identical settings to the official PostgreSQL and NATS images.
 
 **Test receiver**
 
@@ -730,10 +827,13 @@ HookRelay executes a bounded `SELECT 1` and returns sanitized `503` on failure.
 
 **Request-size limit**
 
-A maximum number of bytes accepted for an HTTP request. Producer ingestion has
-field/count bounds but no complete product request-byte/quota policy; the local
-test receiver independently caps captured bodies. Stage 5 must define the
-production boundary.
+A maximum number of bytes accepted for an HTTP request. Stage 5's ASGI boundary
+counts actual streamed body bytes and rejects more than 1 MiB with `413` before
+routing, authentication, or JSON parsing. One all-digit `Content-Length` is an
+early hint compared without converting an unbounded decimal integer; duplicate
+or malformed hints do not replace streamed-byte counting. Event ingestion
+separately rejects a compact validated payload larger than 256 KiB. These caps
+are not tenant storage quotas or substitutes for an external ingress limit.
 
 **End-to-end test**
 
@@ -745,8 +845,8 @@ not every process-kill schedule, production security, HA, or scale.
 
 Pytest metadata for selecting suites. `integration` requires real services;
 `concurrency` highlights overlapping operations; `security` highlights
-authentication/isolation/redaction; `nats` and `e2e` identify broker and
-full-path coverage.
+authentication/isolation/redaction plus request-limit, SSRF, and rotation
+boundaries; `nats` and `e2e` identify broker and full-path coverage.
 
 **Unit test**
 

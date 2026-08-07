@@ -70,7 +70,7 @@ def create_test_receiver(settings: ReceiverSettings | None = None) -> FastAPI:
 
     receiver_settings = settings or get_receiver_settings()
     receiver_state = ReceiverState(receiver_settings.max_captured_requests)
-    app = FastAPI(title="HookRelay test receiver", version="0.4.0")
+    app = FastAPI(title="HookRelay test receiver", version="0.5.0")
     app.state.receiver_settings = receiver_settings
     app.state.receiver_state = receiver_state
 

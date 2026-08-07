@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from hookrelay.api.errors import ApiProblem
 from hookrelay.config import Settings
+from hookrelay.destination_policy import DestinationPolicy
 from hookrelay.models import ApiKey, Tenant
 from hookrelay.security import (
     DUMMY_API_KEY_SECRET_HASH,
@@ -79,6 +80,10 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
 
 def get_secret_cipher(request: Request) -> SecretCipher:
     return cast(SecretCipher, request.app.state.secret_cipher)
+
+
+def get_destination_policy(request: Request) -> DestinationPolicy:
+    return cast(DestinationPolicy, request.app.state.destination_policy)
 
 
 async def require_json_content_type(

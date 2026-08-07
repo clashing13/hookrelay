@@ -86,6 +86,21 @@ class EndpointCreatedResponse(EndpointResponse):
     signing_secret: str = Field(repr=False)
 
 
+class EndpointSigningSecretRotateRequest(StrictModel):
+    """Optimistic precondition for one tenant-scoped signing-secret rotation."""
+
+    expected_active_version: int = Field(ge=1, le=2_147_483_647)
+
+
+class EndpointSigningSecretRotatedResponse(StrictModel):
+    """The replacement signing secret, returned exactly once."""
+
+    endpoint_id: UUID
+    version: int = Field(ge=2)
+    signing_secret: str = Field(repr=False)
+    created_at: datetime
+
+
 DeliveryStatus = Literal[
     "pending",
     "delivering",
