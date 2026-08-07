@@ -1,434 +1,363 @@
 # HookRelay architecture
 
-This document is cumulative. It describes what the repository implements at
-the end of the current stage and labels roadmap components explicitly so a
-diagram is never mistaken for running behavior.
+This document is cumulative through Stage 3 (`0.3.0`). It describes current
+behavior and labels roadmap work explicitly. A successful local demonstration
+is evidence of the implemented path, not evidence of exactly-once delivery,
+high availability, production security, or benchmark scale.
 
-## Current system: Stage 2 durable ingestion
+## Current system: Stage 3 durable delivery pipeline
 
 ```text
-Deployment operator                    Producer
-        |                                 |
-        | bootstrap bearer token          | tenant API key
-        v                                 v
-+----------------------- FastAPI / Uvicorn ------------------------+
-| POST /v1/bootstrap/tenants   POST /v1/endpoints   POST /v1/events |
-| GET  /v1/tenant              GET  /v1/endpoints   GET  /v1/events |
-|                                                                |
-| strict JSON -> authentication -> tenant scope -> unit of work  |
-|                                                |               |
-| /health/live -> process only                   |               |
-| /health/ready -> bounded SELECT 1              |               |
-+-----------------------------+------------------+---------------+
-                              |
-                              | one AsyncSession per request
-                              | explicit transaction commit
-                              v
-                    SQLAlchemy async engine/pool
-                              |
-                              v
-                         PostgreSQL
-       +-------------------------------------------------+
-       | tenants, api_keys, webhook_endpoints, secrets   |
-       | events + deliveries + unpublished outbox rows  |
-       | delivery_attempts schema, currently zero rows   |
-       +-------------------------------------------------+
-
-No outbox publisher -> no NATS -> no delivery worker -> no webhook HTTP
+Deployment operator                         Producer
+        |                                      |
+        | bootstrap token                      | tenant API key
+        v                                      v
++-------------------------- FastAPI / Uvicorn ---------------------------+
+| tenant bootstrap | endpoint creation | idempotent event API | health  |
++--------------------------------+---------------------------------------+
+                                 |
+                                 | event + N delivery snapshots
+                                 | + N outbox rows, one transaction
+                                 v
+                         +-----------------+
+                         |   PostgreSQL    |
+                         | source of truth |
+                         +--^-----------^--+
+                            |           |
+              claim / mark  |           | load / attempt / finish
+                            |           |
+                    +-------+--+        |
+                    | outbox   |        |
+                    | publisher|        |
+                    +-----+----+        |
+                          |             |
+                          | ID-only     |
+                          v             |
+                 +----------------+     |
+                 | NATS JetStream |-----+
+                 | durable stream | durable pull
+                 +----------------+     |
+                                        v
+                              +------------------+
+                              | bounded delivery |
+                              | worker           |
+                              +--------+---------+
+                                       | HMAC-signed HTTP
+                                       v
+                              +------------------+
+                              | local receiver   |
+                              | exact-byte ledger|
+                              +------------------+
 ```
 
-Stage 2 turns the Stage 1 service foundation into a durable intake boundary.
-The word **accepted** has one precise meaning: PostgreSQL committed an event,
-one pending delivery per requested endpoint, and one unpublished
-`delivery.requested` outbox message per delivery. It does not mean a customer
-endpoint was contacted.
+The API, publisher, worker, and receiver are independent processes. A broker or
+receiver outage does not become a synchronous `POST /v1/events` dependency.
+The API's durable-acceptance transaction remains PostgreSQL-only.
 
-## Runtime components
+## Runtime components and ownership
 
-| Component | Responsibility | Explicit non-responsibility |
+| Component | Owns | Does not own |
 | --- | --- | --- |
-| FastAPI application factory | Builds one app and wires settings, database, cipher, errors, and routers | It does not start a server or migrate the database |
-| Pydantic request models | Enforce strict body shapes, bounded names/types, URL syntax, JSON-object payloads, and unique endpoint IDs | They do not impose a whole-request byte limit |
-| Authentication dependency | Parses a bearer API key, finds its public ID, verifies the secret digest, and derives tenant context | It never trusts a caller-supplied tenant ID |
-| Request-scoped `AsyncSession` | Owns one request's database unit of work | It is not shared globally between concurrent requests |
-| `SecretCipher` | Encrypts and authenticates endpoint signing secrets with AES-256-GCM and versioned associated data | It is not a secret manager or automatic rotation service |
-| Ingestion service | Canonicalizes the request, enforces idempotency, snapshots endpoints, and stages domain/outbox rows | It does not publish or send HTTP |
-| PostgreSQL constraints | Enforce tenant relationships, idempotency uniqueness, valid states, and outbox cardinality during races | They do not replace application validation or authorization |
-| Alembic | Applies the explicit Stage 2 schema transition | It never runs as an API startup side effect |
-| Liveness/readiness routes | Separate process health from PostgreSQL availability | Readiness does not prove the domain schema is current or the service has production capacity |
+| FastAPI application | Authentication, tenant scope, validation, idempotent event acceptance, current-state reads, PostgreSQL readiness | Broker publication, delivery execution, migrations, NATS health |
+| PostgreSQL | Authoritative tenant, secret, event, delivery, attempt, and outbox state | Remote receiver side effects or NATS acknowledgment state |
+| Outbox publisher | Short expiring claims, ID-only JetStream publication, PubAck-before-finalize ordering | Event acceptance, HTTP delivery, retry scheduling |
+| NATS JetStream | Durable dispatch message and shared consumer acknowledgment cursor | Event bodies, endpoint URLs, secrets, final domain state |
+| Delivery worker | Durable pulls, authoritative reconciliation, attempt lifecycle, signing, timeout-bounded HTTP, ACK decision | Full retry/crash-recovery policy or production SSRF defense |
+| Test receiver | Configurable local response and bounded exact-byte/header capture | Signature trust enforcement, durable audit storage, customer behavior |
+| SQLAlchemy async engine | One connection pool per database-using process | A global shared session |
+| Alembic | Ordered reviewed schema transitions | Automatic application-start migration |
 
-## Public HTTP surface
+Every database operation uses a short `AsyncSession`. The publisher closes its
+claim transaction before broker I/O. The worker closes its attempt transaction
+before HTTP and opens a second short transaction for finalization.
 
-All mutation routes require `Content-Type: application/json`. Deliberate API
-failures use `application/problem+json` with stable `type`, `title`, `status`,
-`code`, and `detail` fields. Validation failures may add sanitized JSON-pointer
-entries under `errors`; submitted values and internal exceptions are not
-echoed.
+## Public and local HTTP surfaces
 
-| Route | Scope and important headers | Success |
+Mutation routes require `Content-Type: application/json`. Domain failures use
+stable `application/problem+json` responses. Tenant identity always comes from
+a verified API key; a caller never supplies the tenant ID.
+
+| Route | Scope | Meaning of success |
 | --- | --- | --- |
-| `GET /health/live` | public | `200`, no dependency call |
-| `GET /health/ready` | public | `200` after `SELECT 1`; sanitized `503` on dependency failure |
-| `POST /v1/bootstrap/tenants` | `Authorization: Bearer <bootstrap-token>`; bootstrap must be enabled | `201`, `Location: /v1/tenant`, `Cache-Control: no-store`, `Pragma: no-cache` |
-| `GET /v1/tenant` | tenant API-key bearer authentication | `200`, authenticated tenant only |
-| `POST /v1/endpoints` | tenant API-key bearer authentication | `201`, endpoint plus one-time secret and no-store headers |
-| `GET /v1/endpoints/{endpoint_id}` | tenant-scoped lookup | `200`, never returns secret material |
-| `POST /v1/events` | tenant API key and `Idempotency-Key` | `201`, `Location: /v1/events/{id}`; replay also adds `Idempotency-Replayed: true` |
-| `GET /v1/events/{event_id}` | tenant-scoped lookup | `200`, payload and current delivery states |
+| `GET /health/live` | public API | Process/event loop can respond; no dependency call |
+| `GET /health/ready` | public API | A bounded real PostgreSQL `SELECT 1` succeeds |
+| `POST /v1/bootstrap/tenants` | deployment bootstrap bearer | Tenant and one-time initial API key committed |
+| `GET /v1/tenant` | tenant API key | Authenticated tenant metadata |
+| `POST /v1/endpoints` | tenant API key | Endpoint and one-time signing secret committed |
+| `GET /v1/endpoints/{id}` | tenant API key | Secret-free tenant-owned endpoint metadata |
+| `POST /v1/events` | tenant key + idempotency key | Event, delivery snapshots, and outbox rows committed; delivery not implied |
+| `GET /v1/events/{id}` | tenant API key | Current event and delivery states |
 
-Resources outside the authenticated tenant appear as the same opaque `404` as
-missing resources. This prevents a lookup endpoint from becoming a tenant-ID
-oracle.
+The local test receiver exposes `/health/live`, `POST /webhooks`,
+`GET /requests`, `GET /requests/{delivery_id}`, and `DELETE /requests`. It is a
+Compose/test instrument and must not be deployed as a product endpoint.
 
-## Provisioning and credential flows
+## Durable ingestion and idempotency boundary
 
-### Tenant bootstrap
+Stage 2 behavior remains unchanged:
 
-1. A deployment operator explicitly enables bootstrap and configures a
-   32-256-character printable-ASCII token.
-2. The operator sends that token as a bearer credential to
-   `POST /v1/bootstrap/tenants`.
-3. The API compares the supplied token in constant time.
-4. One transaction creates the tenant and an initial API-key record.
-5. The response returns the complete `hrk_<public-id>.<secret>` token once and
-   forbids caching.
-6. The database retains the public ID, a SHA-256 digest of the 256-bit random
-   secret, the last four characters for identification, and revocation/expiry
-   metadata. It never retains the raw secret.
+1. API-key authentication derives tenant context.
+2. A versioned canonical fingerprint covers event type, payload, and endpoint
+   set.
+3. Uniqueness on `(tenant_id, idempotency_key)` plus PostgreSQL
+   `ON CONFLICT DO NOTHING RETURNING` closes concurrent races.
+4. A matching retry returns the original `201` representation and
+   `Idempotency-Replayed: true`; changed input returns `409`.
+5. One transaction creates one event, one pending delivery per endpoint, and
+   one unpublished outbox row per delivery.
+6. Each delivery snapshots its target URL and exact signing-secret row/version.
 
-Bootstrap is a deployment escape hatch for the first tenant, not a public
-signup flow. It defaults to disabled in application settings and should be
-disabled again after provisioning. The Compose example enables it only for the
-local learning workflow.
+`201` means the acceptance transaction committed. The create response reports
+the original pending representation; `GET /v1/events/{id}` is the current-state
+view that can later report `delivering` or `succeeded`.
 
-### Tenant API-key authentication
+## Transactional outbox publication
 
-1. The caller sends `Authorization: Bearer hrk_<public-id>.<secret>`.
-2. Syntax is checked before database work: 12 URL-safe public-ID characters and
-   43 URL-safe secret characters.
-3. The API finds the key by globally unique public ID while requiring an active
-   tenant.
-4. Revoked or expired keys are rejected.
-5. A SHA-256 digest of the presented high-entropy secret is compared with the
-   stored digest using `hmac.compare_digest`.
-6. Success produces internal `tenant_id` and `api_key_id` context. Domain
-   routes never accept either value from the request body.
+### Message contract
 
-Malformed, missing, revoked, expired, and incorrect credentials all return the
-same `401 invalid_credentials` response with `WWW-Authenticate: Bearer`.
+The version-1 `delivery.requested` message contains only:
 
-### Endpoint signing-secret creation
+```text
+type, schema_version, message_id, tenant_id,
+event_id, endpoint_id, delivery_id
+```
 
-An API key authenticates a caller; a signing secret will later authenticate a
-HookRelay webhook to the receiver. They need different storage properties:
+`message_id` equals the outbox UUID and becomes `Nats-Msg-Id`. Event payload,
+URL, and signing secret remain in PostgreSQL.
 
-- an API key only needs verification, so its raw secret is irreversibly hashed;
-- a signing secret will be needed to compute an HMAC later, so it must be
-  recoverable and is encrypted instead.
+### Claim transaction
 
-`POST /v1/endpoints` creates the endpoint and secret in one transaction. The
-secret is `whsec_` plus 256 random bits. AES-256-GCM supplies confidentiality
-and integrity. The ciphertext envelope contains an envelope version, a unique
-96-bit nonce, and the authenticated ciphertext/tag. Associated data binds the
-ciphertext to tenant ID, endpoint ID, secret ID, secret version, envelope
-version, and encryption-key version, so moving a ciphertext to another row
-causes decryption to fail.
+Migration `20260803_0002` adds nullable `claim_token` and `claim_expires_at`
+columns. Constraints require both-or-neither, require expiry after row creation,
+and prevent a published row from remaining claimed. A partial index supports
+unpublished eligibility scans.
 
-Only ciphertext, key version, secret version, and a four-character hint are
-stored. The raw secret appears in the creation response once, with
-`Cache-Control: no-store` and `Pragma: no-cache`. Later endpoint reads omit it.
-The encryption key itself comes from process configuration; production still
-needs an external secret manager, rotation procedure, access control, and
-audit.
+The publisher:
 
-## Event ingestion flow
+1. selects unpublished, unclaimed/expired rows ordered by creation time and ID;
+2. applies a bounded limit and `FOR UPDATE SKIP LOCKED`;
+3. validates topic/schema/payload identity;
+4. assigns one random token and database-time expiry;
+5. commits before NATS I/O;
+6. publishes sequentially and waits for the expected stream PubAck;
+7. conditionally sets `published_at` and clears the claim using row ID + token;
+8. releases still-owned current/remaining claims after a handled failure.
 
-The request body is:
+The settings model requires claim TTL to be strictly greater than
+`batch_size * per_publish_timeout`, covering the maximum aggregate configured
+NATS publish-wait budget. Per-item PostgreSQL finalization and loop overhead are
+additional, so operators should retain margin rather than treating the formula
+as a total batch-runtime bound. During cooperative shutdown, the publisher
+checks its stop event between items and releases the unprocessed remainder.
+
+A hard crash leaves the lease to expire. A broker success followed by lost
+PubAck, or a crash before PostgreSQL finalization, can republish. That is an
+intentional at-least-once boundary.
+
+## JetStream topology
+
+Local Compose runs `nats:2.14.3-alpine3.22` with JetStream enabled, storage at
+`/data`, and a named `nats_data` volume. Client and monitoring ports bind to
+host loopback.
+
+### Stream
+
+| Setting | Current value |
+| --- | --- |
+| Name | `HOOKRELAY_DELIVERIES_V1` |
+| Subject | `hookrelay.delivery.requested.v1` |
+| Retention | work queue |
+| Storage | file |
+| Discard policy | reject new messages when limits are reached |
+| Maximum consumers | one overlapping consumer |
+| Maximum message bytes | 16,384 |
+| Default stream byte limit | 1 GiB |
+| Duplicate window | 600 seconds |
+| Replicas | one |
+
+### Consumer
+
+| Setting | Current value |
+| --- | --- |
+| Durable name | `HOOKRELAY_DELIVERY_WORKERS_V1` |
+| Delivery | pull, deliver all, instant replay |
+| Acknowledgment | explicit |
+| Default `AckWait` | 30 seconds |
+| `MaxDeliver` | unlimited (`-1`) |
+| Default `MaxAckPending` | 32 |
+| Filter | exact delivery-requested subject |
+
+Every publisher/worker connection idempotently creates absent assets and
+validates important existing settings. Incompatible drift fails startup rather
+than silently mutating a durable contract.
+
+One file-backed local replica survives ordinary process/container recreation
+when the named volume remains. It is not a quorum, failover, backup, or HA
+design.
+
+## Worker execution and concurrency
+
+The worker binds to the existing shared durable pull consumer. It fetches no
+more than its local concurrency, waits for the batch to finish, and then fetches
+again. An `asyncio.Semaphore` repeats the hard limit inside execution. The
+long-lived async HTTP client's connection and keep-alive limits match worker
+concurrency; consumer `MaxAckPending` must be at least that limit.
+
+For each strict message:
+
+1. Lock the tenant-owned delivery.
+2. Reconcile the entire broker message with the persisted outbox and delivery.
+3. If the delivery already succeeded, skip HTTP and ACK.
+4. If it is delivering with an unfinished attempt, send broker progress and do
+   not start a concurrent HTTP call.
+5. Require pending state, load the event and snapshotted secret, and enforce the
+   local/test outbound policy.
+6. Decrypt the exact secret using tenant/endpoint/row/version AES-GCM AAD.
+7. Insert the next attempt and set delivery `delivering`; commit.
+8. Send timeout-bounded HTTP without a database lock/session.
+9. Lock again and finish the owned attempt. A 2xx sets attempt and delivery
+   `succeeded`; failure records `transient_failure` and returns delivery to
+   `pending`.
+10. Call `ack_sync` only after a success commit.
+
+Malformed messages and messages whose identities contradict authoritative
+PostgreSQL state are poison and are terminated. A destination blocked by the
+temporary outbound policy is different: it remains unacknowledged and
+recoverable, because a later reviewed policy/configuration may allow it.
+
+## Versioned webhook wire contract
+
+The exact compact, sorted-key UTF-8 body contains:
 
 ```json
 {
-  "type": "order.created",
-  "payload": {"order_id": "ord_123", "total": 42},
-  "endpoint_ids": ["11111111-1111-1111-1111-111111111111"]
+  "created_at": "<original event UTC timestamp with microseconds>",
+  "delivery_id": "<delivery UUID>",
+  "id": "<stable event UUID>",
+  "payload": {},
+  "schema_version": 1,
+  "type": "<event type>"
 }
 ```
 
-The `Idempotency-Key` is an HTTP header, not a body field. Its grammar is 8-128
-ASCII characters from letters, digits, `.`, `_`, `:`, and `-`.
-
-### First successful submission
+The worker sends the compact representation without formatting whitespace. It
+computes:
 
 ```text
-producer
-   |
-   | POST /v1/events
-   | Authorization: Bearer <tenant API key>
-   | Idempotency-Key: demo-event-0001
-   v
-strict body and header validation
-   -> authenticate key and derive tenant
-   -> compute canonical request fingerprint
-   -> verify every endpoint is active, tenant-owned, and has an active secret
-   -> INSERT event ON CONFLICT DO NOTHING
-   -> INSERT one pending delivery snapshot per endpoint
-   -> INSERT one unpublished delivery.requested outbox row per delivery
-   -> COMMIT
-   -> 201 Created + Location
+v1=hex(HMAC-SHA256(secret, ASCII(unix_seconds) + b"." + exact_body_bytes))
 ```
 
-The response is not sent until commit succeeds. A database failure rolls the
-transaction back and returns sanitized `503 database_unavailable`; the caller
-can safely retry with the same idempotency key.
+Headers are `Content-Type`, `User-Agent`, `HookRelay-Delivery-Id`,
+`HookRelay-Event-Id`, `HookRelay-Signature`, `HookRelay-Timestamp`, and
+`HookRelay-Webhook-Version`.
 
-Each delivery snapshots the endpoint URL and signing-secret version ID. A later
-endpoint change must not silently rewrite already accepted work. The outbox
-payload is deliberately ID-only and versioned; it contains identifiers needed
-to load current durable state but no endpoint signing secret or event payload.
+HMAC authenticates integrity and shared-secret possession; it does not encrypt
+the payload. A real receiver must verify the captured raw bytes, use a bounded
+timestamp-freshness window, compare signatures in constant time, and atomically
+deduplicate the stable event ID with its side effect.
 
-### Same-key replay
+## HTTP and outbound safety boundary
 
-The idempotency scope is `(tenant_id, Idempotency-Key)`. Version 1 of the
-fingerprint hashes a canonical JSON representation containing:
+One async client lives for the worker process. It uses explicit
+connect/read/write/pool deadlines plus an outer wall-clock timeout, follows no
+redirects, ignores environment proxy variables, limits connections, and streams
+the response.
 
-- operation name `POST /v1/events`;
-- event type;
-- payload;
-- endpoint IDs sorted by UUID text;
-- fingerprint version.
+Stage 3 delivery execution is restricted to `local` and `test`. The normalized
+URL hostname must be in `HOOKRELAY_DELIVERY_ALLOWED_HOSTS`; defaults are
+`receiver`, `127.0.0.1`, and `localhost`.
 
-Sorting JSON object keys makes object member order irrelevant. Sorting endpoint
-IDs makes target-list order irrelevant. Payload array order remains meaningful.
+This gate is deliberately incomplete. It does not resolve/classify IPs, detect
+DNS rebinding, protect all IPv6/special-use ranges, or enforce network egress.
+Stage 5 owns complete SSRF and traffic-control design. A wildcard allowlist is
+rejected and is not an acceptable workaround.
 
-If the tenant submits the same key and same versioned fingerprint, HookRelay
-loads the original event and deliveries and returns:
+## State and acknowledgment invariants
 
-- HTTP `201 Created`, not `200` or `202`;
-- the same creation representation and stable IDs;
-- the same `Location` header;
-- `Idempotency-Replayed: true`.
+1. Event `201` occurs after event/delivery/outbox commit.
+2. Outbox claims are short and expire; no database lock spans NATS I/O.
+3. `published_at` occurs only after expected-stream PubAck.
+4. Broker payloads never carry event bodies, URLs, or secrets.
+5. Worker execution never trusts broker identities without PostgreSQL checks.
+6. Only local/test and explicitly allowlisted hostnames can execute in Stage 3.
+7. An attempt and `delivering` state commit before HTTP.
+8. No database transaction spans HTTP.
+9. Exact signed bytes equal exact sent bytes.
+10. A 2xx attempt and delivery success commit together.
+11. Broker ACK occurs only after that commit.
+12. A succeeded delivery suppresses duplicate HTTP on broker redelivery.
+13. Failed or policy-blocked work remains unacknowledged/recoverable; malformed
+    or state-contradictory poison messages terminate.
+14. No implementation or documentation claims exactly once.
 
-The replay representation reports each original delivery as `pending`, even if
-a future worker later changes current state. This keeps the creation response
-stable. `GET /v1/events/{id}` is the separate current-state view.
+## Failure boundaries
 
-### Same-key conflict
+| Window | Result |
+| --- | --- |
+| API commit before publisher sees row | Durable outbox remains discoverable |
+| Publisher claim before crash | Lease eventually expires |
+| NATS stores message before PubAck/finalization is known | Possible duplicate publication |
+| Attempt commit before worker crash | Unfinished `delivering` row can remain stuck in Stage 3 |
+| Receiver side effect before HookRelay success commit | Possible duplicate HTTP request |
+| Success commit before broker ACK is known | Redelivery skips HTTP using succeeded database state |
+| Timeout/transport/non-2xx | Transient attempt recorded, delivery pending, message unacknowledged |
 
-If the key already belongs to a different fingerprint, HookRelay creates no
-new rows and returns:
+Stage 4 must add persistent scheduling, backoff/jitter, maximum attempts,
+classification, explicit redelivery policy, stale-attempt recovery, dead-letter
+state, replay, and kill/restart evidence. Current `AckWait` redelivery is not a
+finished retry system.
 
-```json
-{
-  "type": "urn:hookrelay:problem:idempotency-key-reused",
-  "title": "Idempotency key reused",
-  "status": 409,
-  "code": "idempotency_key_reused",
-  "detail": "The Idempotency-Key was already used for a different request."
-}
-```
+## Health, lifecycle, and deployment
 
-Changing the event type, payload, or endpoint set is a different logical
-request. A caller that intends new work must use a new key.
+- API liveness has no dependency call.
+- API readiness probes only PostgreSQL because the API's contract is durable
+  acceptance, not synchronous delivery.
+- Compose health gates startup ordering but does not continuously supervise
+  dependencies.
+- API, publisher, and worker each dispose their database engine.
+- Publisher and worker drain NATS connections during cooperative shutdown with
+  a bounded default drain timeout of five seconds.
+- Worker closes its long-lived HTTP client.
+- Compose gives the worker a 25-second stop grace period, longer than the
+  default ten-second HTTP deadline plus shutdown cleanup margin.
+- NATS/PostgreSQL named volumes survive `docker compose down`; `--volumes`
+  deletes them.
 
-### Concurrent duplicate submissions
-
-An application-level read before insert is only an optimization; two requests
-can both observe “missing.” PostgreSQL closes the race with a unique constraint
-on `(tenant_id, idempotency_key)` and
-`INSERT ... ON CONFLICT DO NOTHING RETURNING`. One transaction wins. The loser
-then loads the committed winner, compares the fingerprint, and replays or
-returns `409`.
-
-This is why idempotency is a database invariant rather than a Python `if`
-statement. It works across processes and replicas that share PostgreSQL.
-
-## Transactional outbox boundary
-
-Without an outbox, this tempting sequence has a dual-write gap:
-
-```text
-commit event to PostgreSQL
-publish delivery message to broker
-```
-
-If the process crashes between the two operations, the accepted event has no
-dispatch message. Reversing the order creates the opposite bug: a consumer can
-see work whose database transaction later rolls back.
-
-Stage 2 writes the event, deliveries, and outbox messages in one PostgreSQL
-transaction:
-
-```text
-BEGIN
-  event
-  + N delivery snapshots
-  + N unpublished outbox messages
-COMMIT
-```
-
-The invariant is all-or-nothing. A future Stage 3 publisher can repeatedly scan
-the partial index on unpublished rows, publish to NATS JetStream, and mark a row
-published. Publishing and marking still cannot be one cross-system atomic
-transaction, so duplicate publication remains possible and consumers must be
-idempotent.
-
-There is no publisher in Stage 2. Every accepted outbox row remains
-`published_at IS NULL`.
-
-## Relational model and tenant isolation
-
-```text
-tenant
-  +-- api_key
-  +-- webhook_endpoint
-  |     +-- endpoint_signing_secret (versioned; one active)
-  +-- event (unique tenant + idempotency key)
-        +-- delivery (one per selected endpoint)
-              +-- outbox_message (one delivery.requested row)
-              +-- delivery_attempt (schema only; none created in Stage 2)
-```
-
-Important database invariants include:
-
-1. Composite foreign keys carry `tenant_id` through API keys, endpoints,
-   secrets, events, deliveries, attempts, and outbox rows. Cross-tenant links
-   are invalid even if an application query is wrong.
-2. `(tenant_id, idempotency_key)` is unique for events.
-3. `(event_id, endpoint_id)` is unique for deliveries.
-4. `(delivery_id, topic)` is unique for outbox messages.
-5. One partial unique index permits only one non-retired signing secret for an
-   endpoint.
-6. Payloads and outbox bodies must be JSON objects; digests have fixed lengths;
-   state strings and timestamp relationships are checked.
-7. Deletes use `RESTRICT` so an operator cannot casually erase an audit chain
-   through cascading deletion.
-
-Models make these relationships usable from Python. The Alembic revision is
-what changes an existing database. Neither artifact substitutes for the other.
-
-## Process, session, and database lifecycle
-
-The Stage 1 ownership model remains:
-
-```text
-one application process
-  -> one SQLAlchemy async engine and connection pool
-  -> many short request-scoped AsyncSessions
-  -> each session borrows connections for its transaction
-  -> shutdown disposes the engine/pool
-```
-
-A session carries mutable unit-of-work and transaction state. Making it global
-would allow concurrent requests to share pending objects, rollback one
-another's work, or commit outside the intended boundary. The engine is the
-long-lived concurrency-safe infrastructure; sessions are not.
-
-## Health and deployment topology
-
-Liveness remains dependency-free. Readiness still executes a bounded
-`SELECT 1` through the real async engine. An unavailable database makes the API
-unready but does not make the process appear dead, and readiness can recover on
-the next request.
-
-Docker Compose publishes API and PostgreSQL ports only on host loopback and
-connects containers over a private network where the database hostname is
-`postgres`. A named volume preserves PostgreSQL data across `docker compose
-down`. Migrations remain an explicit operator/CI step before domain traffic.
-
-Compose serves plain HTTP and is a local topology, not a production ingress.
-Production requires TLS termination, trusted proxy configuration, managed
-secrets, backups, restore drills, deployment ordering, and access controls.
+Environment variables are configuration delivery, not automatic secret
+management. Local credentials are examples; production needs managed secrets,
+TLS/authentication for NATS/PostgreSQL/HTTP boundaries, least privilege,
+rotation, backup, monitoring, and reviewed deployment controls.
 
 ## Verification boundaries
 
-Stage 2 deliberately uses multiple evidence layers:
+| Evidence | Proves | Does not prove |
+| --- | --- | --- |
+| Pure unit vectors | Deterministic body/signature, strict envelope, desired topology, local concurrency bound | Real database, broker, HTTP, or process behavior |
+| Settings tests | Cross-setting safety constraints and local gate | Safe DNS resolution or trustworthy deployment input |
+| PostgreSQL integration | Constraints, leases, transactions, attempt/delivery state | Every crash schedule or long-running recovery |
+| Real JetStream integration | Topology, PubAck, durable pull/ACK behavior | Cluster quorum, disaster recovery, production disk behavior |
+| End-to-end happy path | API -> DB -> publisher -> NATS -> worker -> receiver interoperability | Exactly once, Stage 4 recovery, Stage 5 hostile-network safety, HA, capacity |
+| Compose/image checks | Local topology and packaged Linux artifact | Continuous supervision or production operations |
 
-- Unit tests check deterministic fingerprinting, configuration, cryptographic
-  envelope behavior, and small pure contracts without a network.
-- In-process API tests check headers, status codes, problem bodies,
-  authentication failures, and response redaction.
-- Real PostgreSQL integration tests check the actual migration, constraints,
-  transactions, rollback, tenant isolation, idempotent replay, and concurrent
-  inserts.
-- `alembic check` compares model metadata with the migrated schema.
-- Compose validation and a Docker build check the packaged topology.
-
-Mocks cannot prove PostgreSQL `ON CONFLICT`, JSONB, partial indexes, foreign
-keys, or transaction visibility. A passing PostgreSQL suite cannot prove
-production load, long-lived race coverage, proxy/TLS behavior, hostile payload
-resistance, or receiver compatibility.
-
-## Reliability and security invariants through Stage 2
-
-1. Liveness has no external dependency; readiness touches real PostgreSQL.
-2. A public `201` is emitted only after durable commit.
-3. Event, deliveries, and outbox rows commit or roll back together.
-4. One tenant/key pair identifies at most one logical event.
-5. Same-request replay does not create extra events, deliveries, or outbox rows.
-6. Different-request key reuse is an explicit `409`, not silent aliasing.
-7. Tenant identity comes from verified credentials, never from a body field.
-8. Composite constraints reject cross-tenant relationships at the database
-   boundary.
-9. Raw API-key secrets are not persisted; raw endpoint signing secrets are
-   encrypted and returned only at creation.
-10. Public errors do not expose submitted secrets, database URLs, ciphertext,
-    or internal exception text.
-11. No Stage 2 code claims a queued row was actually attempted or delivered.
-
-## Current limitations and required follow-up
-
-- **No message transport:** NATS JetStream and the outbox publisher arrive in
-  Stage 3. Outbox rows remain unpublished.
-- **No outbound delivery:** there is no HTTP client, HMAC request, worker,
-  concurrency limiter, timeout policy, or receiver acknowledgment.
-- **No attempts:** the `delivery_attempts` schema exists, but Stage 2 creates
-  zero rows and changes no delivery out of `pending`.
-- **No complete SSRF defense:** URL parsing and non-local HTTPS requirements do
-  not block loopback, private, link-local, cloud-metadata, redirect, DNS
-  rebinding, or resolved-IP attacks. No outbound fetch occurs yet. Those checks
-  must exist before a worker contacts untrusted destinations.
-- **No end-to-end TLS in the app:** Uvicorn serves HTTP. Local Compose is bound
-  to `127.0.0.1`; a deployment needs trusted TLS termination. Requiring an
-  HTTPS destination does not secure producer-to-API traffic.
-- **No whole-request limit:** fields and target count are bounded, but the API
-  has no explicit request-body byte cap or tenant payload quota. Ingress and
-  application enforcement are required before hostile public traffic.
-- **No rate or storage quota:** a valid key can currently submit work as fast as
-  infrastructure allows. Rate limits and per-tenant quotas are future work.
-- **No credential-management API:** the schema can represent expiration,
-  revocation, and secret versions, but rotation/revocation workflows are not
-  exposed yet.
-- **No production secret manager:** configuration validation and encryption at
-  rest reduce exposure; they do not provide managed-key access control,
-  rotation, backup, audit, or recovery.
-
-## Planned architecture, not current behavior
+## Roadmap boundary after Stage 3
 
 ```text
 Producer
-  -> HookRelay API
-  -> PostgreSQL event + transactional outbox       (implemented in Stage 2)
-  -> outbox publisher
-  -> NATS JetStream                                (Stage 3)
-  -> bounded-concurrency delivery worker           (Stage 3)
-  -> HMAC-signed HTTP request
-  -> customer endpoint
-     -> retries / jitter / dead letter / replay     (Stage 4)
-     -> SSRF and traffic controls                   (Stage 5)
-     -> observability and operations UI             (Stage 6)
-     -> measured performance and deployment         (Stage 7)
+  -> API + PostgreSQL acceptance                 implemented
+  -> outbox leases + JetStream publication       implemented
+  -> bounded signed delivery + local receiver    implemented
+  -> retry/backoff/crash recovery/dead letters   Stage 4
+  -> full SSRF/rate/circuit controls              Stage 5
+  -> telemetry and operations console            Stage 6
+  -> fault/scale evidence and release             Stage 7
 ```
-
-Future delivery is at least once. PostgreSQL/outbox atomicity prevents one
-important loss window, but it cannot atomically combine HookRelay state, broker
-acknowledgment, an HTTP response, and an independent receiver database.
-Duplicate delivery remains a normal possibility.
 
 ## Decision index
 
-- [Python instead of Go](decisions/0001-python-over-go.md)
-- [PostgreSQL instead of SQLite or MongoDB](decisions/0002-postgresql-over-sqlite-or-mongodb.md)
-- [Explicit Alembic migrations](decisions/0003-explicit-alembic-migrations.md)
-- [At-least-once delivery semantics](decisions/0004-at-least-once-delivery.md)
-- [Transactional outbox](decisions/0005-transactional-outbox.md)
-- [Tenant-scoped idempotency](decisions/0006-tenant-scoped-idempotency.md)
-- [Credential and signing-secret storage](decisions/0007-credential-and-signing-secret-storage.md)
+See [Architecture Decision Records](decisions/README.md), especially:
+
+- [0004: at-least-once delivery](decisions/0004-at-least-once-delivery.md)
+- [0005: transactional outbox](decisions/0005-transactional-outbox.md)
+- [0008: NATS JetStream dispatch](decisions/0008-nats-jetstream-dispatch.md)
+- [0009: versioned webhook signature](decisions/0009-versioned-webhook-signature.md)
+- [0010: Stage 3 local outbound gate](decisions/0010-stage3-local-outbound-gate.md)

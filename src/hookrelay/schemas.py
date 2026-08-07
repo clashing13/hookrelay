@@ -1,4 +1,4 @@
-"""Typed public request and response contracts for Stage 2."""
+"""Typed public request and response contracts for durable ingestion and delivery state."""
 
 import math
 from datetime import datetime

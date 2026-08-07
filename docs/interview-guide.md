@@ -4,17 +4,18 @@ This guide turns the implemented system into precise interview explanations.
 Lead with an invariant and evidence, then state the boundary. Avoid reciting a
 tool list or claiming roadmap behavior as complete.
 
-## Thirty-second Stage 2 pitch
+## Thirty-second Stage 3 pitch
 
-> HookRelay is a webhook-delivery learning project. Through Stage 2 it accepts
-> authenticated tenant events idempotently and commits each event, its per-target
-> delivery snapshots, and transactional-outbox rows atomically in PostgreSQL.
-> Matching retries return the original IDs with `201` and an explicit replay
-> header; conflicting key reuse is `409`, and a database uniqueness constraint
-> closes concurrent races. API keys are hash-only, signing secrets are encrypted
-> because they must be recoverable, and tenant relationships are constrained in
-> the schema. It does not publish to NATS or send webhooks yet, so I call this
-> durable ingestion, not delivery.
+> HookRelay `0.3.0` accepts authenticated events idempotently, commits each
+> event and its dispatch intent atomically in PostgreSQL, and asynchronously
+> sends a signed webhook through a transactional-outbox publisher, NATS
+> JetStream, and a bounded Python worker. The publisher uses expiring database
+> claims and marks rows only after a JetStream PubAck. The worker loads
+> authoritative state, records an attempt, signs exact JSON bytes with a
+> timestamped HMAC, commits success, and only then ACKs the durable message. The
+> guarantee remains at least once; Stage 4 adds designed retry/crash recovery,
+> and Stage 5 replaces the current local-only outbound gate with full SSRF
+> controls.
 
 ## Ninety-second architecture answer
 
@@ -27,20 +28,29 @@ tool list or claiming roadmap behavior as complete.
 3. Tenant routes authenticate bearer keys and derive the tenant internally.
    Callers never choose a tenant ID.
 4. Endpoint creation generates a signing secret, encrypts it with AES-256-GCM,
-   and returns it once. A future worker must recover that secret to sign HTTP.
+   and returns it once. The worker recovers the exact snapshotted version to
+   sign HTTP.
 5. Event submission requires an idempotency header. HookRelay hashes a
    canonical versioned request and uses a tenant/key unique constraint plus
    PostgreSQL `ON CONFLICT` to make retries safe across concurrent API replicas.
 6. The successful transaction creates one event, one pending delivery per
    endpoint, and one unpublished outbox row per delivery. Only after commit does
    the route return `201`.
-7. There is no publisher, NATS, worker, outbound HTTP, or delivery attempt yet.
-   That deliberate boundary makes the durable handoff inspectable before
-   introducing another system.
+7. A separate publisher leases eligible outbox rows in short PostgreSQL
+   transactions, publishes ID-only commands to a file-backed JetStream stream,
+   waits for PubAck, then conditionally records `published_at`.
+8. Workers share a durable pull consumer and bound concurrency with a fetch
+   window, semaphore, HTTP pool, and broker `MaxAckPending`.
+9. A worker reconciles broker IDs with PostgreSQL, commits an unfinished attempt,
+   signs deterministic bytes as `v1=HMAC-SHA256(secret, timestamp.body)`, sends
+   timeout-bounded HTTP, commits success, and then calls `ack_sync`.
+10. The local receiver captures exact bytes and headers for verification. The
+    transport is at least once; Stage 4 owns recovery policy and Stage 5 owns
+    complete outbound security.
 
 ## Whiteboard trace
 
-Draw this without adding roadmap components inside the current boundary:
+Draw the current boundary and keep later roadmap controls outside it:
 
 ```text
 Producer
@@ -54,11 +64,15 @@ Producer
        + N unpublished outbox rows
   -> commit
   -> 201 Created
+  -> outbox lease -> JetStream PubAck -> published_at
+  -> durable pull consumer -> bounded worker
+  -> attempt + delivering commit
+  -> timestamped exact-byte HMAC HTTP
+  -> succeeded attempt + delivery commit
+  -> JetStream ack_sync
 
-Matching retry -> original response + Idempotency-Replayed: true
-Changed retry  -> 409 idempotency_key_reused
-
-Outbox publisher / NATS / HTTP worker: not implemented
+Ambiguity: PubAck before outbox finalization; receiver action before
+HookRelay success certainty. Stable IDs + idempotency, not exactly once.
 ```
 
 ## Stage 1 foundation questions
@@ -110,7 +124,7 @@ Outbox publisher / NATS / HTTP worker: not implemented
 - Async drivers yield the event loop while network I/O waits, allowing other
   requests to progress without a thread per wait.
 - `async def` is not parallel execution and does not make blocking code safe.
-- Database pools and future worker concurrency still need explicit bounds.
+- Database pools and background-worker concurrency still need explicit bounds.
 
 ## Stage 2 design questions
 
@@ -181,12 +195,12 @@ Outbox publisher / NATS / HTTP worker: not implemented
 ### Why one outbox row per delivery rather than one per event?
 
 - One event can target several independently deliverable endpoints.
-- Per-delivery messages give a future worker one scheduling/retry identity per
+- Per-delivery messages give the Stage 3 worker one scheduling/retry identity per
   destination.
 - The unique `(delivery_id, topic)` constraint prevents duplicate dispatch facts
   for the current topic.
 - The versioned ID-only payload avoids putting event bodies or signing secrets
-  on a future broker.
+  on the broker.
 
 ### Why snapshot URL and signing-secret version on the delivery?
 
@@ -204,8 +218,8 @@ Outbox publisher / NATS / HTTP worker: not implemented
   avoids retaining recoverable raw credentials.
 - The API-key secret has 256 random bits, so SHA-256 digest storage is not
   relying on low-entropy password hashing.
-- A future sender must recover an endpoint signing secret to compute an HMAC,
-  so one-way hashing would make delivery impossible.
+- The Stage 3 worker must recover an endpoint signing secret to compute an
+  HMAC, so one-way hashing would make delivery impossible.
 - AES-256-GCM supplies confidentiality and integrity; associated data binds the
   ciphertext to its tenant/endpoint/secret/version context.
 - The encryption key remains a production secret-management responsibility.
@@ -261,17 +275,127 @@ Outbox publisher / NATS / HTTP worker: not implemented
 - Targeted rollback tests should force failure inside the transaction and prove
   every table count remains unchanged.
 
+## Stage 3 delivery-pipeline questions
+
+### Why does the API not publish directly to NATS?
+
+- PostgreSQL and NATS cannot share the API's local transaction.
+- Database-first publishing has a crash gap; broker-first can expose rolled-back
+  work; awaiting both couples API availability to the broker.
+- Event, deliveries, and outbox intent commit together. A separate publisher
+  can resume from PostgreSQL after NATS recovers.
+- Publish/finalize can still duplicate, so the answer is at least once, not
+  exactly once.
+
+### How do multiple publishers coordinate?
+
+- They select eligible unpublished rows in stable order with a bounded limit
+  and `FOR UPDATE SKIP LOCKED`.
+- A short transaction writes a random claim token and database-time expiry.
+- Broker I/O happens after commit, so no row lock or connection is held across
+  NATS latency.
+- Claim TTL must exceed `batch_size * publish_timeout`, covering aggregate
+  broker publish waits; database finalization/loop overhead still need margin,
+  and cooperative shutdown releases the unprocessed remainder.
+- Finalization requires the same token; a dead publisher's lease eventually
+  expires.
+- A crash after PubAck can still cause republishing.
+
+### Why require a JetStream PubAck before `published_at`?
+
+- A successful client call without server persistence evidence is not a safe
+  handoff.
+- `published_at` tells future scans to stop; setting it early could lose work.
+- If PubAck is ambiguous, leaving the row unpublished risks a duplicate rather
+  than silent loss.
+- `Nats-Msg-Id` uses the outbox UUID to reduce quick duplicates, but only inside
+  the broker's configured window.
+
+### Why NATS JetStream instead of Kafka, Redis Streams, or Celery?
+
+- HookRelay needs durable server acknowledgments, a shared cursor, explicit
+  consumer ACKs, and pull-based work-queue flow control.
+- JetStream provides those with a small local topology.
+- Kafka's partitioned retained-log/consumer-group model adds operational
+  concepts not yet justified by measurements.
+- Redis Streams would introduce Redis-specific pending/claim/durability
+  operations; Celery would hide the retry/ACK state machine this project is
+  meant to expose.
+- This is a scope choice, not a universal performance claim.
+
+### Why keep the broker payload ID-only?
+
+- PostgreSQL is authoritative for payload, URL, delivery state, and encrypted
+  secret.
+- ID-only messages avoid duplicating sensitive or stale data in the broker.
+- The worker must reconcile every identity against PostgreSQL before executing.
+- The cost is one authoritative database load for each attempt.
+
+### How is worker concurrency bounded?
+
+- Pull only one configured local window.
+- Use an `asyncio.Semaphore` even if an internal caller presents more messages.
+- Align the long-lived HTTP client's connection pool with worker concurrency.
+- Require consumer `MaxAckPending` to be at least local concurrency and treat
+  it as a global broker-side budget.
+- Async overlaps I/O waits; it is not CPU parallelism or infinite capacity.
+
+### What is the exact signature contract?
+
+- Serialize a version-1 envelope to compact, sorted-key UTF-8 JSON.
+- Use the original event timestamp inside the body and current Unix seconds in
+  `HookRelay-Timestamp`.
+- HMAC-SHA256 signs `ASCII(timestamp) + b"." + exact_body_bytes`.
+- Send the same bytes and `HookRelay-Signature: v1=<lowercase hex>`.
+- HMAC authenticates integrity/secret possession; a receiver separately needs
+  timestamp freshness and stable-event-ID idempotency.
+
+### Why insert an attempt before HTTP and ACK after success commit?
+
+- Attempt-before-HTTP creates an audit/ownership record before an external side
+  effect.
+- No database transaction is held during network waiting.
+- A second transaction finishes the attempt and delivery together.
+- ACK-before-commit could remove the only work item while durable state still
+  says incomplete.
+- Commit-before-ACK can redeliver, but `succeeded` lets the worker skip a second
+  HTTP request and ACK safely.
+
+### What happens on failure today?
+
+- Timeout, transport error, or non-2xx becomes a `transient_failure`; delivery
+  returns to `pending`; the NATS message remains unacknowledged.
+- `AckWait` can expose it again, but there is no persistent schedule, backoff,
+  jitter, classification, maximum, or dead letter yet.
+- A crash after the unfinished-attempt commit can leave delivery `delivering`;
+  Stage 3 reports progress rather than duplicating HTTP, but cannot recover the
+  stale attempt.
+- Stage 4 owns both designed retry and crash recovery.
+
+### Which messages terminate and which stay recoverable?
+
+- Malformed internal envelopes and identities that contradict authoritative
+  PostgreSQL state are poison; the worker terminates them rather than performing
+  HTTP.
+- A valid delivery blocked by the temporary local/test hostname policy is not
+  poison. It remains unacknowledged so a later reviewed policy/configuration can
+  recover it.
+- Stage 4 will add dead-letter and operator recovery semantics.
+
 ## Security and limitation questions
 
-### Does requiring `HttpUrl` or HTTPS solve SSRF?
+### Does requiring `HttpUrl`, HTTPS, or the Stage 3 allowlist solve SSRF?
 
-- No. Syntax validation rejects malformed/userinfo/fragment forms, and
-  staging/production require an HTTPS scheme.
-- Complete SSRF defense must handle loopback/private/link-local/metadata IPs,
-  DNS resolution and rebinding, redirects, IPv6, and network egress policy.
-- Stage 2 performs no outbound request, so it stores risk but does not exercise
-  it. A worker must not be enabled against untrusted URLs until those defenses
-  are in place.
+- No. Schema validation accepts only HTTP(S) syntax and rejects
+  userinfo/fragments. The endpoint API additionally requires HTTPS in
+  staging/production, while Stage 3 delivery workers refuse to run there at
+  all.
+- Stage 3 restricts workers to local/test, requires an explicit hostname
+  allowlist, disables redirects, and ignores environment proxies.
+- Complete SSRF defense must still handle loopback/private/link-local/metadata
+  IPs, DNS resolution/rebinding, IPv6, and network egress policy.
+- The current gate permits a controlled local receiver; it is not safe
+  arbitrary-destination production delivery. Stage 5 owns that boundary.
 
 ### Is producer traffic protected by TLS?
 
@@ -302,6 +426,24 @@ Outbox publisher / NATS / HTTP worker: not implemented
   of the threat model.
 
 ## Test-evidence questions
+
+### How do you know Stage 3 works?
+
+Name evidence by boundary:
+
+- Unit vectors: strict ID-only broker envelope, exact body bytes, fixed HMAC,
+  topology configuration, timeout settings, and semaphore ceiling.
+- PostgreSQL integration: claim ownership/expiry, conditional
+  publish-finalization, attempt-before-HTTP, and attempt/delivery success state.
+- Real JetStream: file-backed stream, durable consumer, PubAck, pull, and ACK.
+- End to end: API acceptance through publisher, broker, worker, real HTTP
+  capture, independent HMAC verification, and final database state.
+- Migrations/packaging: upgrade/downgrade/re-upgrade, `alembic check`, Compose
+  validation, and Linux image build.
+
+Then state the limit: this does not prove every crash schedule, exactly once,
+Stage 4 retry/recovery, Stage 5 hostile-network safety, clustered HA, or
+production throughput.
 
 ### How do you know Stage 2 works?
 
@@ -376,17 +518,21 @@ Use one concrete loop:
 - **Rollback:** injected outbox failure leaves no event or delivery residue.
 - **Dependency outage:** readiness becomes `503` while liveness remains `200`
   and later recovers.
+- **Broker outage:** the API still commits an outbox row while NATS is stopped;
+  after restart the publisher drains it and the local receiver gets the event.
+- **Ambiguous ACK:** a duplicated broker message observes `succeeded`, skips a
+  second HTTP call, and ACKs from durable database state.
 
 For each, say what was observed and one thing the exercise cannot prove.
 
 ### “What would you build next?”
 
-Stage 3 should publish durable outbox rows to NATS JetStream and add a
-bounded-concurrency worker that signs and sends webhook requests. Before that
-worker is exposed to untrusted endpoint URLs, add or deliberately gate SSRF
-defenses. Preserve idempotent message consumption because publish/mark and
-HTTP acknowledgment still have crash ambiguity. Do not jump directly to retry
-polish while the handoff boundary is unverified.
+Stage 4 should replace raw `AckWait` redelivery with persistent retry state,
+classification, exponential backoff and jitter, maximum attempts, stale-attempt
+worker-crash recovery, dead letters, and replay. It must test killed workers and
+unavailable destinations. Stage 5 then replaces the current local/test
+hostname gate with complete DNS/IP/rebinding/egress SSRF controls plus rate and
+circuit protection.
 
 ## Claims to avoid
 
@@ -406,25 +552,36 @@ polish while the handoff boundary is unverified.
 - “Async code is parallel.”
 - “All tests passed, therefore the system is production scale.”
 - “At least once means the receiver's side effect occurs exactly once.”
+- “`Nats-Msg-Id` makes publication exactly once.”
+- “A PubAck and database update are one transaction.”
+- “File-backed single-node JetStream is highly available.”
+- “`AckWait` is our complete retry policy.”
+- “An unfinished Stage 3 attempt always recovers after worker death.”
+- “The hostname allowlist is complete SSRF protection.”
+- “HMAC encrypts the webhook body.”
+- “A timestamp alone prevents replay.”
+- “Async means the worker has unlimited concurrency.”
+- “The happy-path test proves production scale.”
 
-## Three-to-five-minute Stage 2 teach-back
+## Three-to-five-minute Stage 3 teach-back
 
 Aim for this timing:
 
-1. **0:00-0:30 — Boundary:** Product goal, durable-ingestion outcome, and the
-   explicit absence of NATS/outbound attempts.
-2. **0:30-1:10 — Identity:** Bootstrap, one-time API key, bearer verification,
-   derived tenant scope, and composite database enforcement.
-3. **1:10-1:50 — Secrets:** One-time signing secret, hashing versus AES-GCM,
-   associated data, and key-management limit.
-4. **1:50-2:50 — Transaction:** Trace event validation through event + delivery
-   snapshots + outbox and commit-before-`201`.
-5. **2:50-3:40 — Idempotency:** Canonical fingerprint, database race, `201`
-   replay/header, and exact `409` conflict semantics.
-6. **3:40-4:30 — Evidence:** Name the unit/API/PostgreSQL/concurrency/rollback
-   tests and one limit of each layer.
-7. **4:30-5:00 — Risks/next step:** Request-size, TLS, SSRF, quotas, and why the
-   future pipeline remains at least once.
+1. **0:00-0:30 — Boundary:** PostgreSQL `201` acceptance versus asynchronous
+   receiver success and the at-least-once guarantee.
+2. **0:30-1:15 — Publisher:** expiring claim, `SKIP LOCKED`, ID-only message,
+   PubAck, conditional `published_at`, and duplicate window.
+3. **1:15-2:00 — JetStream/backpressure:** file-backed work queue, shared
+   durable pull cursor, explicit ACK, fetch/semaphore/pool/`MaxAckPending`.
+4. **2:00-3:00 — Worker/wire:** authoritative database reconciliation,
+   attempt-before-HTTP, snapshotted secret, exact JSON, timestamped HMAC, and
+   timeout.
+5. **3:00-3:40 — Ordering/ambiguity:** success commit before `ack_sync`,
+   suppression after DB success, and receiver-success ambiguity.
+6. **3:40-4:25 — Evidence:** deterministic vector, real PostgreSQL, real NATS,
+   real HTTP, full happy path, and one limitation of each.
+7. **4:25-5:00 — Boundaries:** retry/crash recovery in Stage 4, full SSRF in
+   Stage 5, and no exactly-once/HA/scale claim.
 
 If any sentence depends on “FastAPI handles it” or “the database guarantees it”
 without naming the route, transaction, constraint, or test, trace one concrete

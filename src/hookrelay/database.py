@@ -24,7 +24,7 @@ class DatabaseHealth(Protocol):
 
 
 class PostgresDatabase:
-    """Own one long-lived SQLAlchemy async engine for an API process."""
+    """Own one long-lived SQLAlchemy async engine for one service process."""
 
     def __init__(self, settings: Settings) -> None:
         self._engine = create_async_engine(
@@ -37,7 +37,7 @@ class PostgresDatabase:
 
     @property
     def engine(self) -> AsyncEngine:
-        """Expose the engine for future short-lived unit-of-work session factories."""
+        """Expose the process-owned engine for migration and integration boundaries."""
 
         return self._engine
 

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from hookrelay.api.dependencies import AuthenticatedTenant, database_unavailable_problem
 from hookrelay.api.errors import ApiProblem
+from hookrelay.broker import OUTBOX_SCHEMA_VERSION, OUTBOX_TOPIC
 from hookrelay.models import (
     Delivery,
     EndpointSigningSecret,
@@ -31,8 +32,6 @@ from hookrelay.schemas import (
 )
 
 REQUEST_FINGERPRINT_VERSION = 1
-OUTBOX_SCHEMA_VERSION = 1
-OUTBOX_TOPIC = "delivery.requested"
 
 
 @dataclass(frozen=True, slots=True)
