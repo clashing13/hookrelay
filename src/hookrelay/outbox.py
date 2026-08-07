@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+from opentelemetry.trace import SpanKind, Status, StatusCode
 from sqlalchemy import CursorResult, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -20,7 +21,16 @@ from hookrelay.broker import (
 from hookrelay.config import Settings, get_settings
 from hookrelay.database import PostgresDatabase
 from hookrelay.logging import configure_logging
+from hookrelay.metrics import HookRelayMetrics, PrometheusServer, start_metrics_server
 from hookrelay.models import OutboxMessage
+from hookrelay.observability import (
+    NOOP_TELEMETRY,
+    PersistedTraceContext,
+    Telemetry,
+    correlation_scope,
+    extract_trace_context,
+    persisted_trace_headers,
+)
 from hookrelay.runtime import install_stop_handlers
 
 
@@ -39,6 +49,8 @@ class ClaimedOutboxMessage:
     outbox_id: UUID
     claim_token: UUID
     message: DeliveryRequestedMessage
+    correlation_id: UUID
+    traceparent: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,10 +86,14 @@ class TransactionalOutboxPublisher:
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
         publisher: OutboxPublisher,
+        telemetry: Telemetry | None = None,
+        metrics: HookRelayMetrics | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._publisher = publisher
+        self._telemetry = telemetry or NOOP_TELEMETRY
+        self._metrics = metrics
         self._logger = logging.getLogger("hookrelay.outbox")
 
     async def _claim_batch(self) -> list[ClaimedOutboxMessage]:
@@ -110,6 +126,8 @@ class TransactionalOutboxPublisher:
                     outbox_id=row.id,
                     claim_token=claim_token,
                     message=_validated_message(row),
+                    correlation_id=row.correlation_id,
+                    traceparent=row.traceparent,
                 )
                 for row in rows
             ]
@@ -117,6 +135,8 @@ class TransactionalOutboxPublisher:
                 row.claim_token = claim_token
                 row.claim_expires_at = claim_expires_at
             await session.commit()
+        if self._metrics is not None:
+            self._metrics.observe_outbox_claimed(len(claimed))
         return claimed
 
     async def _mark_published(self, item: ClaimedOutboxMessage) -> None:
@@ -172,14 +192,38 @@ class TransactionalOutboxPublisher:
             if stop_event is not None and stop_event.is_set():
                 await self._release_claims(claimed[index:])
                 break
-            try:
-                receipt = await self._publisher.publish(item.message)
-            except Exception:
-                await self._release_claims(claimed[index:])
-                raise
-            duplicates += int(receipt.duplicate)
-            await self._mark_published(item)
-            published += 1
+            persisted_context = PersistedTraceContext(
+                correlation_id=item.correlation_id,
+                traceparent=item.traceparent,
+            )
+            with correlation_scope(str(item.correlation_id)):
+                with self._telemetry.start_as_current_span(
+                    "outbox publish",
+                    kind=SpanKind.PRODUCER,
+                    parent_context=extract_trace_context(
+                        persisted_trace_headers(persisted_context)
+                    ),
+                    attributes={
+                        "messaging.system": "nats",
+                        "messaging.operation.name": "publish",
+                        "messaging.destination.name": self._settings.nats_subject,
+                        "messaging.message.id": str(item.message.message_id),
+                        "hookrelay.delivery.id": str(item.message.delivery_id),
+                    },
+                ) as span:
+                    try:
+                        receipt = await self._publisher.publish(item.message)
+                        duplicates += int(receipt.duplicate)
+                        span.set_attribute("messaging.nats.duplicate", receipt.duplicate)
+                        await self._mark_published(item)
+                    except Exception as exc:
+                        span.set_attribute("error.type", type(exc).__name__)
+                        span.set_status(Status(StatusCode.ERROR))
+                        await self._release_claims(claimed[index:])
+                        raise
+                    published += 1
+                    if self._metrics is not None:
+                        self._metrics.observe_outbox_published(duplicate=receipt.duplicate)
         return PublishBatchResult(
             claimed=len(claimed),
             published=published,
@@ -202,6 +246,8 @@ class TransactionalOutboxPublisher:
                     )
                     continue
             except Exception as exc:
+                if self._metrics is not None:
+                    self._metrics.observe_outbox_failure()
                 self._logger.warning(
                     "outbox_publish_failed",
                     extra={"error_type": type(exc).__name__},
@@ -217,24 +263,47 @@ class TransactionalOutboxPublisher:
 
 async def _run() -> None:
     settings = get_settings()
-    configure_logging(settings)
+    logger = configure_logging(settings, service_role="outbox")
+    telemetry = Telemetry.from_settings(settings, service_role="outbox")
+    metrics = HookRelayMetrics()
+    metrics_server: PrometheusServer | None = None
     database = PostgresDatabase(settings)
     broker = JetStreamBroker(settings, client_name="hookrelay-outbox")
     stop_event = asyncio.Event()
     install_stop_handlers(stop_event)
     try:
+        try:
+            metrics_server = await start_metrics_server(
+                settings,
+                metrics,
+                service_role="outbox",
+            )
+        except OSError as exc:
+            logger.warning(
+                "metrics_listener_failed",
+                extra={"error_type": type(exc).__name__, "service_role": "outbox"},
+            )
         await broker.connect()
         publisher = TransactionalOutboxPublisher(
             settings,
             database.session_factory,
             broker,
+            telemetry,
+            metrics,
         )
         await publisher.run(stop_event)
     finally:
         try:
-            await broker.close()
+            if metrics_server is not None:
+                await metrics_server.close()
         finally:
-            await database.dispose()
+            try:
+                await broker.close()
+            finally:
+                try:
+                    await database.dispose()
+                finally:
+                    await telemetry.shutdown()
 
 
 def run() -> None:

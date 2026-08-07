@@ -21,6 +21,12 @@ tests
 docs
 build
 dist
+web/node_modules
+web/dist
+web/playwright-report
+web/test-results
+web/*.tsbuildinfo
+.test-data
 *.egg-info
 .idea
 .vscode

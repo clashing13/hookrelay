@@ -10,6 +10,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from hookrelay.observability import (
+    CORRELATION_SCOPE_KEY,
+    HTTP_CORRELATION_HEADER,
+    normalize_correlation_id,
+)
+
 PROBLEM_MEDIA_TYPE = "application/problem+json"
 
 
@@ -187,10 +193,17 @@ def register_exception_handlers(app: FastAPI) -> None:
         return _response(problem, exc.headers)
 
     @app.exception_handler(Exception)
-    async def handle_unexpected_error(_request: Request, exc: Exception) -> JSONResponse:
+    async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        raw_correlation_id = request.scope.get(CORRELATION_SCOPE_KEY)
+        correlation_id = normalize_correlation_id(
+            raw_correlation_id if isinstance(raw_correlation_id, str) else None
+        )
         logging.getLogger("hookrelay.api").error(
             "unhandled_request_failure",
-            extra={"error_type": type(exc).__name__},
+            extra={
+                "error_type": type(exc).__name__,
+                "correlation_id": correlation_id,
+            },
         )
         problem = ProblemDetail(
             type="urn:hookrelay:problem:internal-error",
@@ -199,4 +212,4 @@ def register_exception_handlers(app: FastAPI) -> None:
             code="internal_error",
             detail="The request could not be completed.",
         )
-        return _response(problem)
+        return _response(problem, {HTTP_CORRELATION_HEADER: correlation_id})

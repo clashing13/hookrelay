@@ -1,11 +1,11 @@
 # HookRelay architecture
 
-This document is cumulative through Stage 5 (`0.5.0`). It describes current
+This document is cumulative through Stage 6 (`0.6.0`). It describes current
 behavior and labels roadmap work explicitly. HookRelay provides at-least-once
 delivery with persistent bounded recovery; it does not claim exactly once,
 high availability, production security, or benchmark scale.
 
-## Current system: Stage 5 security and traffic control
+## Current system: Stage 6 observability and operations
 
 ```text
 Deployment operator                         Producer
@@ -13,7 +13,7 @@ Deployment operator                         Producer
         | bootstrap token                      | tenant API key
         v                                      v
 +-------------------------- FastAPI / Uvicorn ---------------------------+
-| request byte cap | tenant scope | endpoints/rotation | events/replay  |
+| request cap | tenant scope | endpoints/events | history/replay/console |
 +--------------------------------+---------------------------------------+
                                  |
                  endpoint create | URL + DNS/IP preflight
@@ -72,12 +72,58 @@ boundary.
 | NATS JetStream | Durable dispatch message, delayed wake-up, shared consumer ACK state | Event bodies, URLs, secrets, retry budget, terminal domain state |
 | Delivery worker | Durable pull, authoritative reconciliation, shared rate/circuit admission, attempt lease/recovery, signing, policy-enforcing IP-pinned HTTP, classification, ACK/NAK/TERM decision | External firewall/egress policy, receiver idempotency, production capacity |
 | Test receiver | Configurable local response and bounded exact-byte capture | Durable audit, signature enforcement, customer behavior |
+| Operations console | Same-origin tenant delivery history, attempt inspection, and confirmed single replay | Browser credential persistence, payload/URL access, system configuration |
+| OpenTelemetry Collector and Tempo | Failure-isolated trace routing and local trace storage | Product correctness, health, durable delivery state |
+| Prometheus and Grafana | Bounded process metrics and provisioned operational views | Per-delivery audit, billing, production SLO evidence |
 | SQLAlchemy async engine | One connection pool per database-using process | A shared global session |
 | Alembic | Ordered reviewed schema transitions and data backfill | Automatic process-start migration |
 
 Database operations use short `AsyncSession` units. No transaction spans NATS
 or HTTP I/O. Outbox and delivery claims commit before their external operation;
 later conditional updates prove ownership.
+
+## Stage 6 observability and operations plane
+
+The observability plane is adjacent to the data plane. It is never consulted to
+decide whether an event is accepted, whether a delivery is due, or whether a
+broker message can be acknowledged.
+
+```mermaid
+flowchart LR
+  Console["React console /console"] --> History["Tenant history + replay API"]
+  API --> DB[(PostgreSQL)]
+  DB --> Publisher[Outbox publisher]
+  Publisher --> NATS[(JetStream)]
+  NATS --> Worker
+  Worker --> Receiver
+  API -. "OTLP traces" .-> Collector
+  Publisher -. "OTLP traces" .-> Collector
+  Worker -. "OTLP traces" .-> Collector
+  Collector --> Tempo
+  Prometheus -. "scrape" .-> API
+  Prometheus -. "scrape" .-> Publisher
+  Prometheus -. "scrape" .-> Worker
+  Grafana --> Prometheus
+  Grafana --> Tempo
+```
+
+The API binds a canonical correlation UUID in a `ContextVar`, returns it as
+`X-Correlation-ID`, and adds it to structured logs. A valid W3C parent starts
+the server span. Event/replay transactions store correlation UUID and
+`traceparent` beside each outbox row. Publication restores that parent and
+injects the active context into optional NATS headers. The strict schema-v1
+JSON payload and signed receiver request do not change; missing telemetry
+headers remain valid.
+
+Each process owns a custom Prometheus registry. Labels use reviewed bounded
+vocabularies only. Tenant, event, endpoint, delivery, URL, event type, raw path,
+exception, and unrestricted error values are forbidden metric labels.
+
+Delivery history is ordered by `(created_at DESC, id DESC)`. Cursors are
+versioned, filter-bound pagination state, never authorization. Every list,
+detail, and attempt query independently applies the authenticated tenant ID.
+Public schemas omit payloads, URLs, signing-secret identity/ciphertext, API-key
+identity, claim tokens/expiry, broker payloads, and exception text.
 
 ## Public and local HTTP surfaces
 
@@ -97,7 +143,13 @@ before routing or JSON parsing; the default maximum is 1,048,576 bytes.
 | `POST /v1/endpoints/{id}/signing-secret/rotate` | tenant key | Active version replaced atomically; one-time replacement secret returned |
 | `POST /v1/events` | tenant key + idempotency key | Event, delivery snapshots, and generation-1 outbox rows committed |
 | `GET /v1/events/{id}` | tenant key | Current status, dispatch generation, retry due time, and terminal reason |
+| `GET /v1/deliveries` | tenant key | Filtered, keyset-paginated current delivery history |
+| `GET /v1/deliveries/{id}` | tenant key | Safe delivery detail plus attempt summary |
+| `GET /v1/deliveries/{id}/attempts` | tenant key | Lifetime-ordered attempt history across generations |
+| `GET /v1/deliveries/{id}/attempts/{attempt_id}` | tenant key | One safe attempt detail |
 | `POST /v1/deliveries/{id}/replay` | tenant key | `202`; dead-lettered delivery reset to pending in a fresh generation/outbox transaction |
+| `GET /metrics` | local/internal | API process custom Prometheus registry |
+| `GET /console/` | operator browser | Root-owned static operations console assets |
 
 Replay requires JSON `expected_dispatch_generation` and includes
 `Location: /v1/events/{event_id}`. Missing/cross-tenant delivery IDs are
@@ -338,7 +390,7 @@ v1=hex(HMAC-SHA256(secret, ASCII(unix_seconds) + b"." + exact_body_bytes))
 
 Headers remain content type, service `User-Agent`, delivery ID, stable event
 ID, signature, timestamp, and webhook version. `User-Agent` now reports
-`HookRelay/0.5.0`; it is not part of the signed content.
+`HookRelay/0.6.0`; it is not part of the signed content.
 
 HMAC authenticates exact bytes and possession of the snapshotted secret. It
 does not encrypt payloads, prove freshness alone, or deduplicate receiver side
@@ -626,7 +678,16 @@ skip rather than silently substituting SQLite. See the
 limitations. Passing these cases still is not a production-security, HA, or
 scale claim.
 
-## Roadmap boundary after Stage 5
+Stage 6 adds correlation/trace/metric tests, tenant-history API tests,
+equal-timestamp cursor evidence, migration backfill/constraint tests, console
+component tests, and a Playwright workflow against the real API. Provisioning
+files and the production image are also validated. These checks prove the
+encoded observability and operator workflows; they do not prove telemetry
+completeness during exporter failure, accessibility across every assistive
+technology, production cardinality/capacity, or a performance SLO. See the
+[Stage 6 guide](stages/06-observability-operations-console.md).
+
+## Roadmap boundary after Stage 6
 
 ```text
 Producer
@@ -638,7 +699,7 @@ Producer
   -> request limits + SSRF-pinned transport         implemented
   -> per-endpoint rate/circuit + secret rotation    implemented
   -> least-privilege local app containers           implemented
-  -> telemetry/history UI                           Stage 6
+  -> telemetry/history UI                           implemented
   -> fault/scale evidence and release               Stage 7
 ```
 
@@ -659,3 +720,7 @@ See [Architecture Decision Records](decisions/README.md), especially:
 - [0016: request byte limits before parsing](decisions/0016-request-byte-limits-before-parsing.md)
 - [0017: versioned signing-secret rotation](decisions/0017-versioned-signing-secret-rotation.md)
 - [0018: least-privilege app containers](decisions/0018-least-privilege-app-containers.md)
+- [0019: outbox-preserved observability context](decisions/0019-outbox-preserved-observability-context.md)
+- [0020: bounded process-local metrics](decisions/0020-bounded-process-local-metrics.md)
+- [0021: tenant keyset delivery history](decisions/0021-tenant-keyset-delivery-history.md)
+- [0022: same-origin memory-only operations console](decisions/0022-same-origin-memory-only-operations-console.md)

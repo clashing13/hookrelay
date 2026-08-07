@@ -2,10 +2,12 @@
 
 import asyncio
 import logging
-from typing import Protocol
+from collections.abc import Mapping
+from typing import Protocol, cast
 
 from nats.aio.msg import Msg
 from nats.js.client import JetStreamContext
+from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 from pydantic import ValidationError
 
 from hookrelay.broker import DeliveryRequestedMessage, JetStreamBroker, decode_delivery_message
@@ -20,6 +22,14 @@ from hookrelay.delivery import (
     build_http_client,
 )
 from hookrelay.logging import configure_logging
+from hookrelay.metrics import HookRelayMetrics, PrometheusServer, start_metrics_server
+from hookrelay.observability import (
+    NOOP_TELEMETRY,
+    Telemetry,
+    correlation_scope,
+    extract_trace_context,
+    message_correlation_id,
+)
 from hookrelay.runtime import install_stop_handlers
 from hookrelay.security import SecretCipher
 
@@ -65,16 +75,28 @@ class DeliveryExecutorProtocol(Protocol):
 class DeliveryWorker:
     """Process messages with a hard per-process concurrency ceiling."""
 
-    def __init__(self, settings: Settings, executor: DeliveryExecutorProtocol) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        executor: DeliveryExecutorProtocol,
+        telemetry: Telemetry | None = None,
+        metrics: HookRelayMetrics | None = None,
+    ) -> None:
         self._settings = settings
         self._executor = executor
         self._semaphore = asyncio.Semaphore(settings.delivery_worker_concurrency)
+        self._telemetry = telemetry or NOOP_TELEMETRY
+        self._metrics = metrics
         self._logger = logging.getLogger("hookrelay.worker")
 
     async def _ack(self, broker_message: DeliveryBrokerMessage, delivery_id: str) -> None:
         try:
             await broker_message.ack_sync(self._settings.nats_ack_timeout_seconds)
+            if self._metrics is not None:
+                self._metrics.observe_broker_disposition("ack", succeeded=True)
         except Exception as exc:
+            if self._metrics is not None:
+                self._metrics.observe_broker_disposition("ack", succeeded=False)
             self._logger.warning(
                 "delivery_ack_failed",
                 extra={"delivery_id": delivery_id, "error_type": type(exc).__name__},
@@ -88,7 +110,11 @@ class DeliveryWorker:
     ) -> None:
         try:
             await broker_message.nak(delay_seconds)
+            if self._metrics is not None:
+                self._metrics.observe_broker_disposition("nak", succeeded=True)
         except Exception as exc:
+            if self._metrics is not None:
+                self._metrics.observe_broker_disposition("nak", succeeded=False)
             self._logger.warning(
                 "delivery_nak_failed",
                 extra={"delivery_id": delivery_id, "error_type": type(exc).__name__},
@@ -97,7 +123,11 @@ class DeliveryWorker:
     async def _term(self, broker_message: DeliveryBrokerMessage, delivery_id: str | None) -> None:
         try:
             await broker_message.term()
+            if self._metrics is not None:
+                self._metrics.observe_broker_disposition("term", succeeded=True)
         except Exception as exc:
+            if self._metrics is not None:
+                self._metrics.observe_broker_disposition("term", succeeded=False)
             self._logger.warning(
                 "delivery_term_failed",
                 extra={"delivery_id": delivery_id, "error_type": type(exc).__name__},
@@ -107,80 +137,130 @@ class DeliveryWorker:
         """Validate, execute, and ACK only after PostgreSQL records success."""
 
         async with self._semaphore:
+            if self._metrics is not None:
+                self._metrics.worker_message_started()
+            headers = cast(
+                "Mapping[str, object] | None",
+                getattr(broker_message, "headers", None),
+            )
             try:
-                message = decode_delivery_message(broker_message.data)
-            except ValidationError:
-                self._logger.error("delivery_message_invalid")
-                await self._term(broker_message, None)
-                return
-
-            try:
-                result = await self._executor.execute(message)
-                if result.state in {
-                    "succeeded",
-                    "already_succeeded",
-                    "dead_lettered",
-                    "stale",
-                }:
-                    await self._ack(broker_message, str(message.delivery_id))
-                else:
-                    if result.retry_after_seconds is None:
-                        raise RuntimeError("retry disposition is missing its delay")
-                    await self._nak(
-                        broker_message,
-                        result.retry_after_seconds,
-                        str(message.delivery_id),
-                    )
-                    self._logger.warning(
-                        "delivery_redelivery_scheduled",
-                        extra={
-                            "delivery_id": str(message.delivery_id),
-                            "retry_after_seconds": result.retry_after_seconds,
-                            "state": result.state,
+                with correlation_scope(message_correlation_id(headers)):
+                    with self._telemetry.start_as_current_span(
+                        "delivery consume",
+                        kind=SpanKind.CONSUMER,
+                        parent_context=extract_trace_context(headers),
+                        attributes={
+                            "messaging.system": "nats",
+                            "messaging.operation.name": "process",
+                            "messaging.destination.name": self._settings.nats_subject,
                         },
-                    )
-            except DeliveryTargetBlocked as exc:
-                # This is a recoverable policy gate, not a malformed command. Delay it so
-                # a configuration mistake cannot create an AckWait redelivery storm.
-                self._logger.warning(
-                    "delivery_target_blocked",
-                    extra={
-                        "delivery_id": str(message.delivery_id),
-                        "error_type": type(exc).__name__,
-                    },
-                )
+                    ) as span:
+                        await self._process_message_in_context(broker_message, span)
+            finally:
+                if self._metrics is not None:
+                    self._metrics.worker_message_finished()
+
+    async def _process_message_in_context(
+        self,
+        broker_message: DeliveryBrokerMessage,
+        span: Span,
+    ) -> None:
+        try:
+            message = decode_delivery_message(broker_message.data)
+        except ValidationError:
+            span.set_attribute("error.type", "invalid_message")
+            span.set_status(Status(StatusCode.ERROR))
+            if self._metrics is not None:
+                self._metrics.observe_worker_message("invalid")
+            self._logger.error("delivery_message_invalid")
+            await self._term(broker_message, None)
+            return
+
+        span.set_attribute("messaging.message.id", str(message.message_id))
+        span.set_attribute("hookrelay.delivery.id", str(message.delivery_id))
+        span.set_attribute("hookrelay.event.id", str(message.event_id))
+        try:
+            result = await self._executor.execute(message)
+            span.set_attribute("hookrelay.delivery.state", result.state)
+            if self._metrics is not None:
+                self._metrics.observe_worker_message(result.state)
+            if result.state in {
+                "succeeded",
+                "already_succeeded",
+                "dead_lettered",
+                "stale",
+            }:
+                await self._ack(broker_message, str(message.delivery_id))
+            else:
+                if result.retry_after_seconds is None:
+                    raise RuntimeError("retry disposition is missing its delay")
                 await self._nak(
                     broker_message,
-                    self._settings.delivery_policy_block_delay_seconds,
+                    result.retry_after_seconds,
                     str(message.delivery_id),
                 )
-            except DeliveryClaimLost as exc:
-                # A newer worker fenced this attempt. Do not let the stale broker handle
-                # ACK, TERM, or reschedule work now owned by that newer execution.
                 self._logger.warning(
-                    "delivery_claim_lost",
+                    "delivery_redelivery_scheduled",
                     extra={
                         "delivery_id": str(message.delivery_id),
-                        "error_type": type(exc).__name__,
+                        "retry_after_seconds": result.retry_after_seconds,
+                        "state": result.state,
                     },
                 )
-            except DeliveryMessageRejected as exc:
-                self._logger.error(
-                    "delivery_message_rejected",
-                    extra={
-                        "delivery_id": str(message.delivery_id),
-                        "error_type": type(exc).__name__,
-                    },
-                )
-                await self._term(broker_message, str(message.delivery_id))
-            except Exception as exc:
-                self._logger.warning(
-                    "delivery_processing_interrupted",
-                    extra={
-                        "delivery_id": str(message.delivery_id),
-                        "error_type": type(exc).__name__,
-                    },
-                )
+        except DeliveryTargetBlocked as exc:
+            # This is a recoverable policy gate, not a malformed command. Delay it so
+            # a configuration mistake cannot create an AckWait redelivery storm.
+            if self._metrics is not None:
+                self._metrics.observe_worker_message("target_blocked")
+            self._logger.warning(
+                "delivery_target_blocked",
+                extra={
+                    "delivery_id": str(message.delivery_id),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            await self._nak(
+                broker_message,
+                self._settings.delivery_policy_block_delay_seconds,
+                str(message.delivery_id),
+            )
+        except DeliveryClaimLost as exc:
+            # A newer worker fenced this attempt. Do not let the stale broker handle
+            # ACK, TERM, or reschedule work now owned by that newer execution.
+            if self._metrics is not None:
+                self._metrics.observe_worker_message("claim_lost")
+            self._logger.warning(
+                "delivery_claim_lost",
+                extra={
+                    "delivery_id": str(message.delivery_id),
+                    "error_type": type(exc).__name__,
+                },
+            )
+        except DeliveryMessageRejected as exc:
+            span.set_attribute("error.type", type(exc).__name__)
+            span.set_status(Status(StatusCode.ERROR))
+            if self._metrics is not None:
+                self._metrics.observe_worker_message("rejected")
+            self._logger.error(
+                "delivery_message_rejected",
+                extra={
+                    "delivery_id": str(message.delivery_id),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            await self._term(broker_message, str(message.delivery_id))
+        except Exception as exc:
+            span.set_attribute("error.type", type(exc).__name__)
+            span.set_status(Status(StatusCode.ERROR))
+            if self._metrics is not None:
+                self._metrics.observe_worker_message("interrupted")
+            self._logger.warning(
+                "delivery_processing_interrupted",
+                extra={
+                    "delivery_id": str(message.delivery_id),
+                    "error_type": type(exc).__name__,
+                },
+            )
 
     async def process_batch(self, messages: list[DeliveryBrokerMessage]) -> None:
         """Await every bounded task so the loop never creates an unbounded backlog."""
@@ -208,7 +288,10 @@ class DeliveryWorker:
 async def _run() -> None:
     settings = get_settings()
     settings.require_delivery_runtime()
-    configure_logging(settings)
+    logger = configure_logging(settings, service_role="worker")
+    telemetry = Telemetry.from_settings(settings, service_role="worker")
+    metrics = HookRelayMetrics()
+    metrics_server: PrometheusServer | None = None
     database = PostgresDatabase(settings)
     broker = JetStreamBroker(settings, client_name="hookrelay-worker")
     http_client = build_http_client(settings)
@@ -216,6 +299,17 @@ async def _run() -> None:
     subscription: JetStreamContext.PullSubscription | None = None
     install_stop_handlers(stop_event)
     try:
+        try:
+            metrics_server = await start_metrics_server(
+                settings,
+                metrics,
+                service_role="worker",
+            )
+        except OSError as exc:
+            logger.warning(
+                "metrics_listener_failed",
+                extra={"error_type": type(exc).__name__, "service_role": "worker"},
+            )
         await broker.connect()
         subscription = await broker.pull_subscription()
         executor = DeliveryExecutor(
@@ -226,21 +320,30 @@ async def _run() -> None:
                 settings.secret_encryption_key_version,
             ),
             http_client,
+            telemetry=telemetry,
+            metrics=metrics,
         )
-        worker = DeliveryWorker(settings, executor)
+        worker = DeliveryWorker(settings, executor, telemetry, metrics)
         await worker.run(subscription, stop_event)
     finally:
         try:
-            if subscription is not None:
-                await subscription.unsubscribe()
+            if metrics_server is not None:
+                await metrics_server.close()
         finally:
             try:
-                await http_client.aclose()
+                if subscription is not None:
+                    await subscription.unsubscribe()
             finally:
                 try:
-                    await broker.close()
+                    await http_client.aclose()
                 finally:
-                    await database.dispose()
+                    try:
+                        await broker.close()
+                    finally:
+                        try:
+                            await database.dispose()
+                        finally:
+                            await telemetry.shutdown()
 
 
 def run() -> None:

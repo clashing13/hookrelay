@@ -22,6 +22,7 @@ from hookrelay.models import (
     OutboxMessage,
     WebhookEndpoint,
 )
+from hookrelay.observability import capture_persisted_trace_context
 from hookrelay.schemas import (
     DeliveryDetailResponse,
     DeliveryResponse,
@@ -101,6 +102,7 @@ def build_delivery_outbox_message(
 
     outbox_id = uuid4()
     dispatch_generation = delivery.dispatch_generation or 1
+    trace_context = capture_persisted_trace_context()
     return OutboxMessage(
         id=outbox_id,
         tenant_id=tenant_id,
@@ -117,6 +119,8 @@ def build_delivery_outbox_message(
             "tenant_id": str(tenant_id),
             "type": OUTBOX_TOPIC,
         },
+        correlation_id=trace_context.correlation_id,
+        traceparent=trace_context.traceparent,
     )
 
 

@@ -8,8 +8,12 @@ __pycache__/
 # Virtual environments and local tooling
 .venv/
 .uv-cache/
+.pnpm-store/
 .coverage
 htmlcov/
+node_modules/
+playwright-report/
+test-results/
 
 # Local configuration and secrets
 .env

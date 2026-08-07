@@ -15,7 +15,7 @@ jobs:
   validate:
     name: Lint, test, migrate, and build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       UV_NO_PROGRESS: "1"
       HOOKRELAY_ENVIRONMENT: test
@@ -48,6 +48,16 @@ jobs:
         with:
           python-version: 3.12.13
 
+      - name: Set up Node.js 24.14.0
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.14.0
+
+      - name: Enable pnpm 11.16.0
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.16.0 --activate
+
       - name: Start NATS 2.14.3 with file-backed JetStream
         run: |
           docker run --detach --name hookrelay-ci-nats \
@@ -68,6 +78,15 @@ jobs:
 
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
+
+      - name: Install locked console dependencies
+        run: pnpm --dir web install --frozen-lockfile
+
+      - name: Type-check, test, and build the console
+        run: |
+          pnpm --dir web run typecheck
+          pnpm --dir web run test
+          pnpm --dir web run build
 
       - name: Lint
         run: uv run ruff check .
@@ -91,6 +110,30 @@ jobs:
           uv run alembic downgrade base
           uv run alembic upgrade head
 
+      - name: Install Playwright Chromium
+        run: pnpm --dir web exec playwright install --with-deps chromium
+
+      - name: Run the real API and browser operations workflow
+        env:
+          HOOKRELAY_BOOTSTRAP_ENABLED: "true"
+          HOOKRELAY_BOOTSTRAP_TOKEN: hookrelay-stage6-ci-bootstrap-token-change-me
+          HOOKRELAY_E2E_BOOTSTRAP_TOKEN: hookrelay-stage6-ci-bootstrap-token-change-me
+        run: |
+          uv run uvicorn hookrelay.main:app --host 127.0.0.1 --port 8000 >hookrelay-e2e-api.log 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8000/health/ready >/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              cat hookrelay-e2e-api.log
+              exit 1
+            fi
+            sleep 1
+          done
+          pnpm --dir web run test:e2e
+
       - name: Run PostgreSQL integration tests
         run: uv run pytest -m "integration and not concurrency"
 
@@ -103,7 +146,7 @@ jobs:
       - name: Validate Compose and build the image
         run: |
           docker compose config --quiet
-          docker build --pull --tag hookrelay-api:stage5 .
+          docker build --pull --tag hookrelay-api:stage6 .
 
       - name: Verify the least-privilege application runtime
         run: >-

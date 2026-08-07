@@ -1,7 +1,7 @@
 # HookRelay glossary
 
-This glossary is cumulative through Stage 5 (`0.5.0`). Entries marked
-**future** describe planned behavior, not a capability of the current
+This glossary is cumulative through Stage 6 (`0.6.0`). Any entry explicitly
+marked **future** describes roadmap behavior, not a capability of the current
 repository.
 
 ## Product and HTTP terms
@@ -14,10 +14,11 @@ attempted, acknowledged, or delivered; those are later asynchronous states.
 
 **API (Application Programming Interface)**
 
-A contract through which software communicates. HookRelay exposes health,
-protected bootstrap, authenticated tenant/endpoint inspection, endpoint
-creation/signing-secret rotation, idempotent event submission, delivery replay,
-and health routes.
+A contract through which software communicates. HookRelay exposes health and
+metrics, protected bootstrap, authenticated tenant/endpoint inspection,
+endpoint creation/signing-secret rotation, idempotent event submission,
+tenant-scoped delivery/attempt history, and delivery replay. It also serves the
+same-origin operations console at `/console/`.
 
 **Application factory**
 
@@ -100,7 +101,9 @@ Used when a JSON mutation route is called without
 **HTTP `422 Unprocessable Content`**
 
 Used when syntactically valid JSON violates the request schema, such as a bad
-URL, duplicate endpoint IDs, an unexpected field, or an invalid event type.
+URL, duplicate endpoint IDs, an unexpected field, or an invalid event type. A
+malformed, unsupported-version, or filter-mismatched history cursor also
+returns `422`.
 
 **HTTP `503 Service Unavailable`**
 
@@ -118,6 +121,13 @@ to the authenticated tenant.
 A response header present with value `true` when an event-create response came
 from a matching existing idempotency record. It is absent on the first
 acceptance.
+
+**`X-Correlation-ID`**
+
+A response header containing HookRelay's canonical request correlation UUID.
+A valid inbound value is reused; a missing or invalid value is replaced. The
+same value appears in structured logs and is persisted with accepted outbox
+work so later asynchronous processes can retain the request lineage.
 
 **`Location`**
 
@@ -242,15 +252,19 @@ An ordered, reviewable schema transition. Stage 2 creates the domain schema;
 Stage 3 adds recoverable outbox claims; Stage 4 revision `20260804_0003` adds
 retry, delivery-claim, generation, terminal, and replay state; Stage 5 revision
 `20260805_0004` creates/backfills per-endpoint traffic-control rows and adds
-probe evidence to attempts. Editing an ORM model does not update a database.
+probe evidence to attempts; Stage 6 revision `20260806_0005` adds persisted
+outbox correlation/trace context and tenant-safe delivery/attempt history
+indexes. Editing an ORM model does not update a database.
 
 **Outbox message**
 
 A durable record that dispatch work needs publishing. Initial delivery and
 each manual replay generation have one strict schema-v1, ID-only
 `delivery.requested` row with a fresh UUID. The database row, not the broker
-payload, carries authoritative dispatch generation. The publisher waits for a
-NATS PubAck before setting `published_at`.
+payload, carries authoritative dispatch generation. Stage 6 also persists a
+correlation UUID and optional canonical `traceparent` beside that payload; the
+publisher forwards them as NATS headers without changing JSON schema v1. It
+waits for a NATS PubAck before setting `published_at`.
 
 **Partial index**
 
@@ -265,8 +279,9 @@ for domain entities.
 
 **Relational source of truth**
 
-The authoritative durable state. PostgreSQL, not a future broker or in-memory
-cache, determines whether an event was accepted and which deliveries exist.
+The authoritative durable state. PostgreSQL, not NATS, telemetry backends, or
+an in-memory cache, determines whether an event was accepted and which
+deliveries exist.
 
 **Rollback**
 
@@ -361,9 +376,10 @@ An authenticated `202` operation that increments a dead-lettered delivery's
 dispatch generation and atomically creates a fresh outbox row. Its JSON request
 must match the generation the operator observed, preventing one ambiguous
 intent from advancing twice. It preserves attempt history and grants the new
-generation a bounded retry budget. Missing/cross-tenant IDs use opaque `404`;
-a valid tenant-owned delivery outside `dead_lettered` returns
-`409 delivery_not_replayable`.
+generation a bounded retry budget. The console uses this same API after an
+explicit confirmation; it does not receive elevated authority. Missing or
+cross-tenant IDs use opaque `404`; a valid tenant-owned delivery outside
+`dead_lettered` returns `409 delivery_not_replayable`.
 
 **Signing-secret rotation precondition**
 
@@ -785,6 +801,139 @@ worker understands the unchanged v1 envelope but not generation fencing.
 An outcome the current policy may retry, including timeout, async transport
 error, `408`, `425`, `429`, and `5xx`, while the current generation has budget.
 
+## Observability and operations terms
+
+**Correlation ID**
+
+A UUID used to connect related evidence across process and time boundaries. It
+is useful for search and support, but is neither authentication nor proof that
+a webhook succeeded. HookRelay persists it on every outbox row so publisher
+and worker activity retains the accepting request's lineage.
+
+**Structured JSON log**
+
+One machine-parseable JSON object per log event. HookRelay includes bounded
+fields such as timestamp, severity, message, service, version, environment,
+process role, and available correlation/trace/span IDs. It records sanitized
+error categories rather than secrets, payloads, URLs, or exception text.
+
+**Trace**
+
+A causally related collection of timed spans. A HookRelay trace may connect API
+acceptance, outbox publication, broker consumption, policy admission, and an
+HTTP attempt, even though those steps occur in different processes and times.
+Trace presence is diagnostic evidence, not durable product state.
+
+**Span**
+
+A timed operation inside a trace with a parent relationship and bounded
+attributes. HookRelay creates explicit spans at durable/asynchronous boundaries
+where automatic HTTP instrumentation alone cannot describe the workflow.
+
+**W3C Trace Context / `traceparent`**
+
+The interoperable carrier for trace ID, parent span ID, flags, and version.
+HookRelay stores only a validated canonical `traceparent`, carries it in a NATS
+header, and starts asynchronous child spans from it. This changes observability
+metadata, not the strict schema-v1 broker JSON body.
+
+**OpenTelemetry (OTel)**
+
+A vendor-neutral API and SDK model for traces, metrics, and logs. HookRelay
+uses its tracing SDK explicitly and can export batches when telemetry is
+enabled; the product remains functional when export is disabled or unavailable.
+
+**OTLP/HTTP**
+
+OpenTelemetry's HTTP export protocol. Enabling HookRelay telemetry requires a
+credential-free configured endpoint; local Compose points it at the Collector.
+
+**OpenTelemetry Collector**
+
+The optional local process that receives OTLP and forwards traces to Tempo. It
+is an observability dependency, not a product dependency or readiness target.
+
+**Prometheus**
+
+A pull-based time-series monitoring system. It scrapes the API's `/metrics`
+route and internal publisher/worker listeners. A counter increases, a gauge may
+rise or fall, and a histogram groups observations into predefined buckets.
+
+**Metric label and cardinality**
+
+A label is a bounded dimension attached to a metric series; cardinality is the
+number of distinct label combinations. Delivery IDs, endpoint IDs, URLs, event
+types, correlation IDs, and free-form errors are excluded because unbounded
+values can exhaust a metrics backend.
+
+**Process-local metrics registry**
+
+The explicit Prometheus registry owned by one HookRelay process. API,
+publisher, and worker metrics are intentionally separate, avoiding implicit
+global collectors and making each scrape target's ownership clear. These
+registries are not shared distributed counters.
+
+**Tempo**
+
+The optional local trace store queried through Grafana. Losing Tempo history
+does not lose PostgreSQL delivery state or attempt evidence.
+
+**Grafana and provisioning**
+
+Grafana renders the local Prometheus metrics and Tempo traces. Checked-in
+provisioning creates repeatable data sources and dashboards; it is a teaching
+and diagnostic surface, not a production SLO, alerting, or capacity claim.
+
+**Delivery history**
+
+Tenant-scoped inspection of current delivery state plus immutable HTTP-attempt
+rows across dispatch generations. It is not event sourcing or a complete audit
+of every former state, traffic deferral, stale broker message, or replay actor.
+Safe response models omit payload, target URL, secret material/references,
+claim tokens, broker envelopes, tenant IDs, and free-form exception text.
+
+**Keyset pagination**
+
+Pagination that asks for rows after a stable ordered position instead of using
+an offset. HookRelay orders deliveries by `(created_at DESC, id DESC)` and
+attempts by lifetime attempt number descending with ID as a tie-breaker, which
+avoids duplicate/omitted rows caused by shifting offsets.
+
+**Opaque cursor**
+
+A versioned base64url navigation token encoding a keyset position and filter
+fingerprint. Clients must return it unchanged; it is not authorization, and
+changing its route/filter context produces `422`. Tenant predicates still
+enforce ownership.
+
+**Same-origin operations console**
+
+The React application served by the HookRelay API under `/console/`. It calls
+fixed relative `/v1` routes so browser API requests share the API origin. Its
+tenant key exists only in JavaScript memory, a refresh signs out, and replay
+uses the same tenant-scoped expected-generation API as any other client.
+
+**Content Security Policy (CSP)**
+
+A browser response policy restricting where a page may load code and other
+resources. HookRelay combines a restrictive CSP with `nosniff`, no-referrer,
+and frame-denial headers; these controls reduce browser attack surface but do
+not turn the console into production IAM or RBAC.
+
+**Telemetry failure isolation**
+
+The rule that logging, tracing export, metrics scraping, Collector, Tempo,
+Prometheus, and Grafana failures must not roll back accepted work or make
+readiness fail. PostgreSQL remains the readiness dependency and product source
+of truth.
+
+Primary Stage 6 references: the
+[observability and operations-console guide](stages/06-observability-operations-console.md),
+[ADR 0019](decisions/0019-outbox-preserved-observability-context.md),
+[ADR 0020](decisions/0020-bounded-process-local-metrics.md),
+[ADR 0021](decisions/0021-tenant-keyset-delivery-history.md), and
+[ADR 0022](decisions/0022-same-origin-memory-only-operations-console.md).
+
 ## Testing and operations terms
 
 **`alembic check`**
@@ -794,11 +943,12 @@ It catches some model/migration drift after the migration has been applied.
 
 **Integration test**
 
-A test crossing a real system boundary. Through Stage 5, integration coverage
+A test crossing a real system boundary. Through Stage 6, integration coverage
 uses PostgreSQL, NATS JetStream, and HTTP receiver behavior for migrations,
 claims, schedules, fencing, publication, attempts, dead letters, replay, and
 the delivery path, plus PostgreSQL-shared traffic control, rotation snapshots,
-and tenant isolation.
+tenant-safe history/cursors, preserved replay evidence, and isolation. Browser
+end-to-end coverage exercises the console against a real seeded API.
 
 **Least-privilege app container**
 
@@ -823,7 +973,9 @@ remain healthy during a PostgreSQL outage.
 **Readiness probe**
 
 The question “can this instance currently handle dependency-backed traffic?”
-HookRelay executes a bounded `SELECT 1` and returns sanitized `503` on failure.
+HookRelay executes a bounded PostgreSQL `SELECT 1` and returns sanitized `503`
+on failure. Telemetry backends are intentionally excluded because they are not
+required to accept or process product work.
 
 **Request-size limit**
 
@@ -841,12 +993,20 @@ A test that crosses API, PostgreSQL, outbox publisher, JetStream, worker, and
 receiver boundaries. It proves the tested success/recovery path interoperates,
 not every process-kill schedule, production security, HA, or scale.
 
+**Browser end-to-end test**
+
+A Playwright-driven console workflow against a seeded HookRelay API. It proves
+the browser can authenticate in memory, filter and inspect server state, and
+exercise explicitly seeded replay behavior. It does not prove production
+browser compatibility, IAM, accessibility completeness, or audit controls.
+
 **Test marker**
 
 Pytest metadata for selecting suites. `integration` requires real services;
 `concurrency` highlights overlapping operations; `security` highlights
 authentication/isolation/redaction plus request-limit, SSRF, and rotation
-boundaries; `nats` and `e2e` identify broker and full-path coverage.
+boundaries; `nats` and Python `e2e` identify broker and full delivery-path
+coverage. The separate `pnpm --dir web run test:e2e` command drives Playwright.
 
 **Unit test**
 

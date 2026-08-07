@@ -147,6 +147,70 @@ class DeliveryReplayResponse(StrictModel):
     dispatch_generation: int = Field(ge=2)
 
 
+class DeliveryInspectionResponse(StrictModel):
+    """Tenant-safe current delivery state for operations inspection."""
+
+    id: UUID
+    event_id: UUID
+    event_type: str
+    endpoint_id: UUID
+    endpoint_name: str
+    status: DeliveryStatus
+    dispatch_generation: int = Field(ge=1)
+    created_at: datetime
+    next_attempt_at: datetime | None = None
+    dead_lettered_at: datetime | None = None
+    dead_letter_reason: (
+        Literal[
+            "permanent_failure",
+            "attempts_exhausted",
+            "target_blocked",
+        ]
+        | None
+    ) = None
+    attempt_count: int = Field(ge=0)
+    last_attempt_at: datetime | None = None
+    replayable: bool
+
+
+class DeliveryHistoryResponse(StrictModel):
+    """One bounded page of tenant-owned deliveries in reverse creation order."""
+
+    items: list[DeliveryInspectionResponse]
+    next_cursor: str | None = None
+
+
+DeliveryAttemptOutcome = Literal[
+    "succeeded",
+    "transient_failure",
+    "permanent_failure",
+    "abandoned",
+]
+
+
+class DeliveryAttemptDetailResponse(StrictModel):
+    """Immutable attempt evidence without claims, secrets, URLs, or event bodies."""
+
+    id: UUID
+    delivery_id: UUID
+    attempt_number: int = Field(ge=1)
+    dispatch_generation: int = Field(ge=1)
+    is_circuit_probe: bool
+    started_at: datetime
+    finished_at: datetime | None = None
+    outcome: DeliveryAttemptOutcome | None = None
+    response_status_code: int | None = Field(default=None, ge=100, le=599)
+    error_code: str | None = Field(default=None, max_length=100)
+    duration_ms: int | None = Field(default=None, ge=0)
+
+
+class DeliveryAttemptHistoryResponse(StrictModel):
+    """One bounded page of lifetime-monotonic attempts for a delivery."""
+
+    items: list[DeliveryAttemptDetailResponse]
+    next_cursor: str | None = None
+
+
 class EventCreate(StrictModel):
     event_type: Annotated[
         str,
