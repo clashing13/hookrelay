@@ -1,111 +1,148 @@
 # HookRelay
 
-HookRelay is a fault-tolerant webhook delivery platform built as a seven-stage
-distributed-systems learning project. The finished platform will durably store
-events and make HMAC-signed webhook deliveries with at-least-once semantics,
-retry recovery, traffic controls, dead-letter replay, and observability.
+HookRelay is a fault-tolerant webhook-delivery platform built as a seven-stage
+distributed-systems learning project. Version `0.3.0` implements the first
+complete local happy path:
 
-Stage 2 implements **authenticated, idempotent, durable event ingestion**. An
-accepted request is committed to PostgreSQL together with one pending delivery
-and one unpublished transactional-outbox row per selected endpoint. It is not
-sent over HTTP yet. Start with the [Stage 2 learning guide](docs/stages/02-event-ingestion.md)
-for the full request trace, schema rationale, tests, safe failure exercise, and
-teach-back checklist. The [Stage 1 guide](docs/stages/01-foundation.md) remains
-the foundation reference.
+```text
+Producer
+  -> FastAPI
+  -> PostgreSQL event + transactional outbox
+  -> outbox publisher
+  -> NATS JetStream
+  -> bounded delivery worker
+  -> HMAC-signed HTTP request
+  -> configurable local test receiver
+```
 
-## Stage 2 capabilities
+Start with the [Stage 3 delivery-pipeline guide](docs/stages/03-delivery-pipeline.md)
+for the full event trace, exact wire contract, failure exercises, tests, and
+teach-back checklist. The [Stage 2](docs/stages/02-event-ingestion.md) and
+[Stage 1](docs/stages/01-foundation.md) guides remain the detailed foundation.
 
-- protected tenant bootstrap with a one-time initial API-key response;
-- tenant authentication through `Authorization: Bearer <api-key>`;
-- tenant-scoped webhook endpoint creation and inspection;
-- generated endpoint signing secrets encrypted at rest and returned only when
-  the endpoint is created;
-- `POST /v1/events` with a required, tenant-scoped `Idempotency-Key`;
-- deterministic replay: the same key and logical request returns the original
-  response with HTTP `201` and `Idempotency-Replayed: true`;
-- conflict detection: reusing the key for a different logical request returns
-  HTTP `409` without creating more work;
-- one PostgreSQL transaction for the event, delivery snapshots, and
-  `delivery.requested` outbox rows;
-- strict request models, stable `application/problem+json` errors, and opaque
-  cross-tenant `404` responses;
-- the first explicit Alembic revision, with relational constraints that enforce
-  tenant ownership and close concurrent idempotency races;
-- async unit/API tests plus real PostgreSQL migration, integration, security,
-  rollback, and concurrency tests.
+## Stage 3 capabilities
 
-Stage 2 does **not** contain NATS, an outbox publisher, outbound webhook HTTP,
-HMAC request signing, retries, or delivery-attempt creation. The
-`delivery_attempts` table reserves the later audit model, but a successful
-Stage 2 submission creates zero attempt rows.
+- authenticated, tenant-scoped, idempotent event ingestion;
+- one PostgreSQL transaction for an event, delivery snapshots, and one
+  versioned outbox row per destination;
+- expiring PostgreSQL claim leases so publishers do not hold row locks during
+  broker I/O;
+- NATS 2.14.3 with a file-backed work-queue stream,
+  `HOOKRELAY_DELIVERIES_V1`, on `hookrelay.delivery.requested.v1`;
+- a shared durable pull consumer, `HOOKRELAY_DELIVERY_WORKERS_V1`;
+- ID-only broker payloads and `Nats-Msg-Id` set to the outbox UUID;
+- bounded async worker concurrency and matching HTTP connection limits;
+- attempt-before-HTTP state and success-commit-before-ACK ordering;
+- deterministic version-1 JSON signed with HMAC-SHA256 over
+  `timestamp + "." + exact_body_bytes`;
+- explicit HTTP timeout, no redirects, and no environment proxy inheritance;
+- a configurable local receiver that retains bounded exact body/header evidence;
+- a real PostgreSQL/JetStream/HTTP happy-path test.
 
-## HTTP contract at a glance
+The default 60-second claim TTL must remain greater than the aggregate broker
+publish-timeout budget (`25` rows x `2` seconds each), with margin for database
+finalization and loop overhead. Cooperative publisher shutdown releases the
+unprocessed claim remainder, and NATS drain is bounded to five seconds.
+
+The API, outbox publisher, worker, and receiver are separate processes. The API
+can continue durable PostgreSQL acceptance while NATS is temporarily
+unavailable; background backlog is observable in `outbox_messages`.
+
+## Current guarantee and limits
+
+HookRelay is **at least once**, never general-purpose exactly once. JetStream
+may store a publication whose PubAck is lost, or a receiver may commit a side
+effect before HookRelay loses the HTTP response or its own success update.
+Stable event IDs and receiver-side idempotency are required.
+
+Stage 3 is intentionally a local/test delivery boundary:
+
+- workers refuse to run in staging or production;
+- target hostnames must be explicitly allowlisted;
+- redirects and environment proxies are disabled;
+- complete DNS/IP/rebinding/egress SSRF protection arrives in Stage 5.
+
+Stage 4 owns designed retry scheduling, exponential backoff, jitter, maximum
+attempts, classification, stale-attempt/worker-crash recovery, dead letters,
+and replay. Today, a timeout, transport error, or non-2xx result is recorded as
+a transient failure and left unacknowledged for JetStream `AckWait` redelivery.
+That behavior is not a finished retry policy. Policy-blocked destinations also
+remain unacknowledged/recoverable; only malformed or authoritative-state-
+mismatched poison messages are terminated.
+
+Local Compose uses one file-backed NATS replica and named volume. It does not
+claim high availability, disaster recovery, production security, or benchmark
+scale.
+
+## HTTP contract
 
 | Method and route | Authentication | Success contract |
 | --- | --- | --- |
 | `GET /health/live` | none | `200`; process-local health |
 | `GET /health/ready` | none | `200` after a bounded PostgreSQL probe |
-| `POST /v1/bootstrap/tenants` | deployment bootstrap bearer token | `201`; tenant and raw initial API key returned once |
+| `POST /v1/bootstrap/tenants` | bootstrap bearer token | `201`; tenant and raw initial API key returned once |
 | `GET /v1/tenant` | tenant API key | `200`; authenticated tenant only |
 | `POST /v1/endpoints` | tenant API key | `201`; endpoint and raw signing secret returned once |
-| `GET /v1/endpoints/{endpoint_id}` | tenant API key | `200`; tenant-owned endpoint metadata, never the secret |
-| `POST /v1/events` | tenant API key plus `Idempotency-Key` | `201`; durable event and pending deliveries |
-| `GET /v1/events/{event_id}` | tenant API key | `200`; tenant-owned event and current delivery states |
+| `GET /v1/endpoints/{endpoint_id}` | tenant API key | `200`; secret-free tenant-owned metadata |
+| `POST /v1/events` | tenant API key plus `Idempotency-Key` | `201`; durable event and initial pending deliveries |
+| `GET /v1/events/{event_id}` | tenant API key | `200`; event and current delivery states |
 
-JSON mutation routes require `Content-Type: application/json`. Bootstrap and
-endpoint creation add `Cache-Control: no-store` and `Pragma: no-cache` because
-their successful responses contain one-time credentials. Event creation adds a
-`Location` header on both first acceptance and replay. A replay additionally
-adds `Idempotency-Replayed: true`; a first acceptance omits that header.
+The receiver is a local inspection tool, not a product API:
+
+| Route | Purpose |
+| --- | --- |
+| `GET /health/live` | receiver process health |
+| `POST /webhooks` | configurable delivery target |
+| `GET /requests` | bounded captured-request list |
+| `GET /requests/{delivery_id}` | captures for one delivery |
+| `DELETE /requests` | clear in-memory captures |
 
 ## Prerequisites
 
 - Git
 - CPython 3.12 or newer
-- Docker Desktop with Docker Compose for the complete local workflow
-- approximately 2 GB of free disk space for images and the named volume
+- Docker Desktop with Docker Compose
+- approximately 2 GB of free disk space
 
-The repository pins `uv` 0.12.1, Python image 3.12.13 on Debian Bookworm, and
-PostgreSQL 17.7 on Debian Bookworm. `uv.lock` pins the complete Python dependency
-graph. Image tags are updated only through a reviewed rebuild and test change.
+The repository pins `uv` 0.12.1, Python 3.12.13 on Debian Bookworm,
+PostgreSQL 17.7, and NATS 2.14.3 on Alpine 3.22. `uv.lock` pins the complete
+Python dependency graph.
 
 ## Fastest start: Docker Compose
 
+Windows PowerShell:
+
 ```powershell
-git clone --branch codex/stage-02-event-ingestion --single-branch https://github.com/clashing13/hookrelay.git
+git clone --branch codex/stage-03-delivery-pipeline --single-branch https://github.com/clashing13/hookrelay.git
 Set-Location hookrelay
 Copy-Item .env.example .env
 ```
 
-While the stacked Stage 2 pull request is open, the branch flags select its
-implementation. After Stage 2 merges into the default branch, omit
-`--branch codex/stage-02-event-ingestion --single-branch`.
-
-Edit the ignored `.env` now. Replace `POSTGRES_PASSWORD`,
-`HOOKRELAY_SECRET_ENCRYPTION_KEY`, and `HOOKRELAY_BOOTSTRAP_TOKEN` before any
-container initializes or stores data. Then start and migrate:
+Before the first Compose startup, edit the ignored `.env`: choose the local
+database password, encryption key, and bootstrap token you will actually use.
+The checked-in examples are not deployable secrets. Commands below that show
+example credentials must be updated to those chosen values.
 
 ```powershell
-docker compose build api
-docker compose up --detach --wait postgres
+$env:POSTGRES_HOST_PORT = "55432"
+docker compose build
+docker compose up --detach --wait postgres nats receiver
 docker compose run --rm api alembic upgrade head
 docker compose up --detach --wait api
+docker compose up --detach outbox-publisher worker
+docker compose ps
 ```
 
-The checked-in values are local-development examples. For a quick
-loopback-only walkthrough they do run as written, but do not reuse them outside
-local development.
-
-Check the service:
+Check each local boundary:
 
 ```powershell
 curl.exe --fail http://127.0.0.1:8000/health/live
 curl.exe --fail http://127.0.0.1:8000/health/ready
-docker compose ps
+curl.exe --fail http://127.0.0.1:9000/health/live
+Invoke-RestMethod 'http://127.0.0.1:8222/healthz?js-enabled-only=true'
 ```
 
-Bootstrap a local tenant. The token below matches `.env.example`; substitute
-your replacement if you changed it:
+Bootstrap a tenant and retain the one-time API key:
 
 ```powershell
 $bootstrapHeaders = @{
@@ -124,16 +161,14 @@ $bootstrap = Invoke-RestMethod `
 $apiKey = $bootstrap.api_key.key
 ```
 
-Treat `$apiKey` as a password. HookRelay stores only its SHA-256 digest and
-cannot show the raw key again.
-
-Create an endpoint and retain its one-time signing secret:
+Create a receiver endpoint. Because the worker runs inside Compose, use the
+service name `receiver`, not host loopback:
 
 ```powershell
 $authHeaders = @{ Authorization = "Bearer $apiKey" }
 $endpointBody = @{
   name = "Local receiver"
-  url = "http://127.0.0.1:9000/hooks"
+  url = "http://receiver:9000/webhooks"
 } | ConvertTo-Json
 $endpoint = Invoke-RestMethod `
   -Method Post `
@@ -144,10 +179,7 @@ $endpoint = Invoke-RestMethod `
 $signingSecret = $endpoint.signing_secret
 ```
 
-The URL may use HTTP only in the `local` and `test` environments. No request is
-sent to it in Stage 2.
-
-Submit an event and then replay the exact logical request:
+Submit an event and poll the receiver/current-state route:
 
 ```powershell
 $eventHeaders = @{
@@ -159,77 +191,74 @@ $eventBody = @{
   payload = @{ order_id = "ord_123"; total = 42 }
   endpoint_ids = @($endpoint.id)
 } | ConvertTo-Json -Depth 5
-$first = Invoke-WebRequest `
+$event = Invoke-RestMethod `
   -Method Post `
   -Uri http://127.0.0.1:8000/v1/events `
   -Headers $eventHeaders `
   -ContentType "application/json" `
   -Body $eventBody
-$replay = Invoke-WebRequest `
-  -Method Post `
-  -Uri http://127.0.0.1:8000/v1/events `
-  -Headers $eventHeaders `
-  -ContentType "application/json" `
-  -Body $eventBody
-$first.StatusCode
-$first.Headers.Location
-$replay.StatusCode
-$replay.Headers["Idempotency-Replayed"]
-$replay.Content
+$deliveryId = $event.deliveries[0].id
+
+do {
+  Start-Sleep -Milliseconds 250
+  $captures = @(
+    Invoke-RestMethod "http://127.0.0.1:9000/requests/$deliveryId"
+  )
+} while ($captures.Count -eq 0)
+
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/v1/events/$($event.id)" `
+  -Headers $authHeaders
 ```
 
-Both status codes are `201`; the replay header is `true`, and the replay body
-contains the original event and delivery IDs. Change `payload`, `type`, or the
-set of `endpoint_ids` while keeping the same key to observe the documented
-`409 idempotency_key_reused` response.
+See the [Stage 3 guide](docs/stages/03-delivery-pipeline.md#verify-exact-body-bytes-and-hmac-independently)
+for independent HMAC verification and durable-state inspection.
 
-Stop the containers while preserving database data:
+Stop containers while preserving PostgreSQL and NATS data:
 
 ```powershell
 docker compose down
 ```
 
-`docker compose down --volumes` also deletes the named PostgreSQL volume and
-its data. Use it only when you intentionally want a clean database.
+`docker compose down --volumes` deletes both named volumes. Use it only for an
+intentional fresh start.
 
 ## Host Python workflow
 
-Create a local environment and install exactly what `uv.lock` records.
-
-Windows PowerShell:
+Create a locked environment:
 
 ```powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install uv==0.12.1
+.\.venv\Scripts\python.exe -m pip install --disable-pip-version-check uv==0.12.1
 .\.venv\Scripts\uv.exe sync --frozen --all-groups
 ```
 
-macOS or Linux:
-
-```bash
-python3.12 -m venv .venv
-.venv/bin/python -m pip install uv==0.12.1
-.venv/bin/uv sync --frozen --all-groups
-```
-
-Run PostgreSQL with Compose, then point the host process at its published port:
+Start PostgreSQL, NATS, and the receiver, then use host addresses:
 
 ```powershell
-if (-not (Test-Path -LiteralPath '.env')) { Copy-Item .env.example .env }
-docker compose up --detach --wait postgres
-$env:HOOKRELAY_DATABASE_URL = "postgresql+asyncpg://hookrelay:change-me-for-local-development@127.0.0.1:5432/hookrelay"
-$env:HOOKRELAY_BOOTSTRAP_ENABLED = "true"
-$env:HOOKRELAY_BOOTSTRAP_TOKEN = "replace-this-local-bootstrap-token-before-use"
+$env:POSTGRES_HOST_PORT = "55432"
+docker compose up --detach --wait postgres nats receiver
+$env:HOOKRELAY_DATABASE_URL = "postgresql+asyncpg://hookrelay:change-me-for-local-development@127.0.0.1:55432/hookrelay"
+$env:HOOKRELAY_NATS_URL = "nats://127.0.0.1:4222"
+$env:HOOKRELAY_ENVIRONMENT = "local"
+$env:HOOKRELAY_DELIVERY_ALLOWED_HOSTS = '["127.0.0.1","localhost"]'
 .\.venv\Scripts\alembic.exe upgrade head
-.\.venv\Scripts\hookrelay.exe
 ```
 
-The default local encryption key is loaded from `.env`. Set a unique
-`HOOKRELAY_SECRET_ENCRYPTION_KEY` before storing anything you care about.
+Run these long-lived commands in separate terminals with the same environment:
+
+```powershell
+.\.venv\Scripts\hookrelay.exe
+.\.venv\Scripts\hookrelay-outbox.exe
+.\.venv\Scripts\hookrelay-worker.exe
+```
+
+For a host-run worker, create endpoints using
+`http://127.0.0.1:9000/webhooks`.
 
 ## Checks
 
-Fast checks do not need PostgreSQL:
+Fast checks:
 
 ```powershell
 .\.venv\Scripts\ruff.exe check .
@@ -238,57 +267,40 @@ Fast checks do not need PostgreSQL:
 .\.venv\Scripts\pytest.exe -m "not integration"
 ```
 
-With Compose PostgreSQL available on the default host port:
+Real-service checks:
 
 ```powershell
-$env:HOOKRELAY_TEST_DATABASE_URL = "postgresql+asyncpg://hookrelay:change-me-for-local-development@127.0.0.1:5432/hookrelay"
+$env:POSTGRES_HOST_PORT = "55432"
+docker compose stop api outbox-publisher worker receiver
+docker compose up --detach --wait postgres nats
+$env:HOOKRELAY_TEST_DATABASE_URL = "postgresql+asyncpg://hookrelay:change-me-for-local-development@127.0.0.1:55432/hookrelay"
 $env:HOOKRELAY_DATABASE_URL = $env:HOOKRELAY_TEST_DATABASE_URL
+$env:HOOKRELAY_NATS_URL = "nats://127.0.0.1:4222"
+$env:HOOKRELAY_TEST_NATS_URL = "nats://127.0.0.1:4222"
 .\.venv\Scripts\alembic.exe upgrade head
-.\.venv\Scripts\pytest.exe -m integration
+.\.venv\Scripts\pytest.exe -m "integration and not concurrency"
+.\.venv\Scripts\pytest.exe -m concurrency
 .\.venv\Scripts\alembic.exe check
 docker compose config --quiet
-docker build --pull --tag hookrelay:stage2 .
+docker build --pull --tag hookrelay:stage3 .
 ```
 
-The integration suite owns its test rows but not an arbitrary personal
-database. Point it only at a disposable local/CI database. Passing unit tests
-alone does not prove PostgreSQL constraints, transactional rollback, concurrent
-idempotency, migration alignment, container networking, or packaging. Passing
-every current check still does not prove production capacity.
+Stopping the long-lived application processes prevents them from claiming rows
+created by the deterministic integration harness. Substitute the password you
+chose in `.env`, and use only a disposable local/test database.
+
+Passing every current check still does not prove exactly once, failure
+recovery, HA, hostile network safety, or production capacity.
 
 ## Migration policy
 
-Run migrations explicitly with `alembic upgrade head`. The API never calls
-`metadata.create_all()` and does not migrate at startup. Stage 2 adds the first
-meaningful revision, `20260802_0001`, for tenants, credentials, endpoints,
-events, deliveries, delivery attempts, and outbox messages. ORM models and
-migrations are separate artifacts; update and review both when the schema
-changes.
+Run migrations explicitly with `alembic upgrade head`. The API and background
+processes never migrate at startup. Stage 2 revision `20260802_0001` creates the
+domain schema. Stage 3 revision `20260803_0002` adds recoverable outbox claim
+tokens/expiries, consistency constraints, and a partial claim-scan index.
 
-## Security boundary and current limitations
-
-- Raw API keys are returned once and stored only as SHA-256 digests. Endpoint
-  signing secrets must be recoverable for future signing, so they are stored as
-  AES-256-GCM ciphertext with versioned key metadata and bound associated data.
-- The development encryption key and bootstrap token are intentionally unsafe
-  examples. Production requires an external secret manager, rotation, audit,
-  least privilege, and a disabled bootstrap surface after provisioning.
-- Stage 2 validates URLs and requires HTTPS destinations in staging/production,
-  but it does not resolve hosts or block loopback, private, link-local, metadata,
-  or rebinding targets. That is not complete SSRF protection. There is no
-  outbound request in this stage; a future worker must add defenses before it
-  fetches untrusted URLs.
-- The application serves plain HTTP. Compose binds it to `127.0.0.1`; deployed
-  environments need TLS termination and a trusted proxy/network boundary.
-  Destination-URL HTTPS validation does not encrypt producer-to-HookRelay
-  traffic.
-- Field lengths, event-type grammar, unique endpoint IDs, and a 100-endpoint
-  maximum are enforced, but there is no explicit whole-request byte limit or
-  payload-size quota yet. A reverse proxy limit and application-level quota are
-  required before exposing ingestion to untrusted traffic.
-- Rate limiting, key-management APIs, secret rotation workflows, NATS,
-  publishing, outbound delivery, attempts, retries, dead letters, and production
-  observability remain later-stage work.
+ORM models and migrations are separate artifacts. Changing one does not update
+the other or an existing database; review both and run `alembic check`.
 
 ## Documentation
 
@@ -297,18 +309,8 @@ changes.
 - [Interview guide](docs/interview-guide.md)
 - [Stage 1: service foundation](docs/stages/01-foundation.md)
 - [Stage 2: durable event ingestion](docs/stages/02-event-ingestion.md)
+- [Stage 3: durable delivery pipeline](docs/stages/03-delivery-pipeline.md)
 - [Architecture decision records](docs/decisions/README.md)
-
-## Delivery guarantee
-
-Stage 2 guarantees durable acceptance only after PostgreSQL commits the event,
-its delivery snapshots, and their outbox messages. It makes no claim that a
-webhook has been attempted or delivered.
-
-The future delivery pipeline will provide **at least once**, not
-general-purpose exactly once. A destination can complete a side effect while
-its acknowledgment is lost, so HookRelay may retry. Stable event IDs plus
-receiver-side idempotency are the duplicate-safety strategy.
 
 ## License
 

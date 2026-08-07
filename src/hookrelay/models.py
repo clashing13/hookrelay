@@ -1,4 +1,4 @@
-"""SQLAlchemy mappings for HookRelay's durable Stage 2 domain."""
+"""SQLAlchemy mappings for HookRelay's durable ingestion and delivery domain."""
 
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -263,7 +263,7 @@ class Delivery(CreatedAtMixin, Base):
 
 
 class DeliveryAttempt(Base):
-    """An immutable record of one worker attempt; Stage 2 creates no rows yet."""
+    """An immutable-identity record whose completion fields describe one HTTP attempt."""
 
     __tablename__ = "delivery_attempts"
     __table_args__ = (
@@ -333,6 +333,25 @@ class OutboxMessage(CreatedAtMixin, Base):
             "id",
             postgresql_where=text("published_at IS NULL"),
         ),
+        Index(
+            "ix_outbox_messages_unpublished_claim_expires_at",
+            "claim_expires_at",
+            "created_at",
+            "id",
+            postgresql_where=text("published_at IS NULL"),
+        ),
+        CheckConstraint(
+            "(claim_token IS NULL) = (claim_expires_at IS NULL)",
+            name="claim_fields_consistent",
+        ),
+        CheckConstraint(
+            "claim_expires_at IS NULL OR claim_expires_at > created_at",
+            name="claim_expiry_after_creation",
+        ),
+        CheckConstraint(
+            "published_at IS NULL OR claim_token IS NULL",
+            name="published_message_not_claimed",
+        ),
         CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload_is_object"),
     )
 
@@ -348,4 +367,6 @@ class OutboxMessage(CreatedAtMixin, Base):
     )
     topic: Mapped[str] = mapped_column(String(100), nullable=False)
     payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    claim_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -1,15 +1,16 @@
 # HookRelay glossary
 
-This glossary is cumulative through Stage 2. Entries marked **future** describe
-planned behavior, not a capability of the current repository.
+This glossary is cumulative through Stage 3 (`0.3.0`). Entries marked
+**future** describe planned behavior, not a capability of the current
+repository.
 
 ## Product and HTTP terms
 
 **Accepted event**
 
-An event for which HookRelay has committed the event, pending delivery
-snapshots, and unpublished outbox messages to PostgreSQL. In Stage 2,
-"accepted" does not mean published, attempted, acknowledged, or delivered.
+An event for which HookRelay committed the event, delivery snapshots, and
+outbox messages to PostgreSQL. "Accepted" still does not mean published,
+attempted, acknowledged, or delivered; those are later asynchronous states.
 
 **API (Application Programming Interface)**
 
@@ -181,19 +182,19 @@ from another tenant even if application code makes a mistake.
 
 **Delivery**
 
-One intended dispatch of one event to one endpoint. Stage 2 creates it in
-`pending` state and snapshots the target URL and signing-secret version. It does
-not execute it.
+One intended dispatch of one event to one endpoint. Ingestion creates it in
+`pending` state with a target-URL and signing-secret-version snapshot. Stage 3
+can move it through `delivering` to `succeeded`.
 
 **Delivery attempt**
 
-An immutable record of one worker try, with timing and outcome. The Stage 2
-schema defines this table for the later audit trail, but current ingestion
-creates zero attempt rows. Attempt execution is **future**.
+A durable record of one worker try, including its number, start/finish time,
+outcome, response status or sanitized error code, and duration. Stage 3 creates
+it unfinished before HTTP, then updates its completion fields afterward.
 
 **Endpoint signing secret**
 
-A generated `whsec_...` value that a future worker will use to authenticate
+A generated `whsec_...` value the delivery worker recovers to authenticate
 webhook requests with an HMAC. Unlike an API key, it must be recoverable, so it
 is encrypted rather than irreversibly hashed.
 
@@ -215,15 +216,15 @@ payloads while requiring their top-level value to be an object.
 
 **Migration**
 
-An ordered, reviewable schema transition. Stage 2's Alembic revision creates
-the first HookRelay domain schema. Editing an ORM model does not update an
-existing database.
+An ordered, reviewable schema transition. Stage 2's revision creates the domain
+schema; Stage 3's `20260803_0002` revision adds recoverable outbox claim fields,
+constraints, and an index. Editing an ORM model does not update a database.
 
 **Outbox message**
 
-A durable record that dispatch work needs publishing. Each Stage 2 delivery has
-one versioned, ID-only `delivery.requested` message with `published_at = NULL`.
-There is no publisher yet.
+A durable record that dispatch work needs publishing. Each delivery has one
+versioned, ID-only `delivery.requested` row. Stage 3 claims it, waits for a NATS
+PubAck, and only then sets `published_at`.
 
 **Partial index**
 
@@ -270,8 +271,9 @@ guard across all API replicas.
 
 **Webhook endpoint**
 
-A tenant-owned destination name and URL. URL storage is implemented; outbound
-HTTP is not. The current `enabled` response field maps to stored active state.
+A tenant-owned destination name and URL. Stage 3 performs outbound HTTP only
+for explicit local/test allowlist targets; full production SSRF controls arrive
+in Stage 5. The current `enabled` response field maps to stored active state.
 
 ## Idempotency and concurrency terms
 
@@ -353,14 +355,14 @@ digests, and idempotency fingerprints.
 **Encryption**
 
 A reversible transformation using a protected key. It is appropriate for
-signing secrets because a future worker must recover them. Encryption is not
-the same as hashing.
+signing secrets because the delivery worker must recover them. Encryption is
+not the same as hashing.
 
 **Encryption-key version**
 
 Metadata identifying which configured key encrypted a secret. It makes a
-deliberate rotation/re-encryption workflow possible, but Stage 2 does not
-implement that workflow.
+deliberate rotation/re-encryption workflow possible, but no rotation workflow
+is implemented through Stage 3.
 
 **Entropy**
 
@@ -376,9 +378,9 @@ input is important; hashing alone does not make human-chosen passwords safe.
 
 **HMAC (Hash-based Message Authentication Code)**
 
-A keyed integrity/authenticity value. A future worker will sign webhook
-requests with endpoint secrets. Stage 2 stores the required secret version but
-does not compute or send an HMAC.
+A keyed integrity/authenticity value. Stage 3 computes HMAC-SHA256 over the
+ASCII Unix timestamp, one dot byte, and the exact request body bytes. HMAC does
+not encrypt the payload or provide receiver idempotency.
 
 **Nonce**
 
@@ -396,12 +398,13 @@ A Pydantic wrapper that reduces accidental secret display in representations
 and errors. Code can still deliberately reveal the value; it is not encryption,
 access control, or a secret manager.
 
-**SSRF (Server-Side Request Forgery)** — **future defense**
+**SSRF (Server-Side Request Forgery)** — **complete defense is future**
 
 Abusing a server's outbound fetch to reach unintended internal or privileged
-targets. Stage 2 stores URLs but sends no request. URL syntax and HTTPS
-requirements are not complete SSRF protection; IP resolution, redirect, DNS
-rebinding, and network-egress controls are still required before delivery.
+targets. Stage 3 sends HTTP only in local/test, checks an explicit hostname
+allowlist, disables redirects, and ignores environment proxies. Those controls
+are not complete SSRF protection: resolved-IP classification, DNS rebinding,
+IPv6/special ranges, and egress controls remain Stage 5 work.
 
 **TLS (Transport Layer Security)**
 
@@ -446,17 +449,55 @@ rollbacks across callers.
 
 ## Reliability and messaging terms
 
-**At-least-once delivery** — **future execution**
+**Acknowledgment (`ACK`)**
+
+A consumer signal that one broker message completed successfully. HookRelay
+uses synchronous JetStream acknowledgment only after PostgreSQL commits the
+successful attempt and delivery state.
+
+**Acknowledgment wait (`AckWait`)**
+
+The period JetStream waits for an ACK or progress signal before a message is
+eligible for redelivery. It is not a complete retry schedule and supplies no
+backoff, jitter, or maximum-attempt policy.
+
+**At-least-once delivery**
 
 A logical event may be attempted more than once so transient or ambiguous
-failures do not silently lose it. Stage 2 prepares durable work but performs no
-attempts.
+failures do not silently lose it. Stage 3 implements the success path and
+retains duplicate-publication/HTTP ambiguity; receiver idempotency remains
+required.
+
+**Bounded concurrency**
+
+A hard ceiling on simultaneous work. Stage 3 aligns a worker fetch window,
+`asyncio.Semaphore`, HTTP connection pool, and JetStream `MaxAckPending` rather
+than creating an unbounded task/socket backlog.
+
+**Canonical body bytes**
+
+The deterministic compact, sorted-key UTF-8 representation used for both HMAC
+and HTTP. A receiver must verify these raw bytes rather than re-serializing JSON.
+
+**Claim lease**
+
+An expiring `claim_token` plus `claim_expires_at` on an outbox row. It lets a
+publisher commit ownership, release its database locks before broker I/O, and
+later finalize only while its token still matches. Expiry recovers abandoned
+claims. The TTL must exceed the configured sequential batch size multiplied by
+the per-publish timeout.
 
 **Dead letter** — **future**
 
 Work moved to an explicit terminal operational state after retry policy is
-exhausted. The Stage 2 delivery status vocabulary reserves `dead_lettered`, but
-no retry/dead-letter behavior exists.
+exhausted. The delivery status vocabulary reserves `dead_lettered`, but Stage 3
+has no maximum-attempt or dead-letter behavior. Stage 4 owns it.
+
+**Durable consumer**
+
+A named JetStream cursor whose delivery/acknowledgment state survives client
+disconnects. All Stage 3 workers bind to
+`HOOKRELAY_DELIVERY_WORKERS_V1` rather than receiving independent copies.
 
 **Dual write**
 
@@ -471,16 +512,58 @@ this general claim across its database, a broker, HTTP, and an independent
 receiver database. Receiver-side idempotency can provide effectively-once
 business behavior.
 
-**NATS JetStream** — **future**
+**`Nats-Msg-Id`**
 
-The planned durable message transport between outbox publishing and delivery
-workers. It is not a Stage 2 runtime dependency.
+A JetStream publication header used for duplicate detection within a finite
+window. HookRelay sets it to the outbox UUID. It reduces quick duplicates but
+does not guarantee exactly once.
+
+**NATS JetStream**
+
+The durable message transport between the Stage 3 outbox publisher and delivery
+workers. HookRelay uses one file-backed work-queue stream and an explicit-ACK
+durable pull consumer. PostgreSQL remains the domain source of truth.
+
+**Poison message**
+
+An internally malformed command or one whose identities contradict
+authoritative PostgreSQL state. The Stage 3 worker terminates it rather than
+performing HTTP. A destination blocked by the temporary outbound policy is not
+classified as poison and remains unacknowledged/recoverable.
+
+**Policy-blocked delivery**
+
+Valid durable work whose destination is not permitted by the current Stage 3
+local/test runtime and hostname gate. It remains unacknowledged so a later
+reviewed policy/configuration can recover it; it is not silently discarded.
+
+**Publish acknowledgment (`PubAck`)**
+
+JetStream confirmation that a message was accepted into the expected stream.
+The outbox publisher requires it before marking the PostgreSQL row published.
+
+**Pull consumer**
+
+A consumer whose client requests a bounded batch when it has capacity. Stage 3
+uses pull delivery to align broker flow with worker concurrency.
 
 **Transactional outbox**
 
 Writing a domain change and a to-be-published message in the same database
 transaction. It closes the event-commit/message-not-created gap. It does not
 make later broker publication exactly once.
+
+**Work-queue retention**
+
+A JetStream policy that keeps a message for one eligible consumer until it is
+acknowledged, subject to configured limits. It is a dispatch queue, not a
+permanent event-history log.
+
+**Webhook signature version**
+
+The `v1=` signature prefix plus `HookRelay-Webhook-Version: 1`. It labels the
+current timestamp/body grammar so incompatible changes can be versioned rather
+than silently breaking receivers.
 
 ## Testing and operations terms
 
@@ -491,8 +574,16 @@ It catches some model/migration drift after the migration has been applied.
 
 **Integration test**
 
-A test crossing a real system boundary. Stage 2 uses PostgreSQL integration
-tests for migrations, constraints, concurrency, and transactional behavior.
+A test crossing a real system boundary. Through Stage 3, integration coverage
+uses PostgreSQL, NATS JetStream, and HTTP receiver behavior for migrations,
+claims, constraints, publication, attempts, and the happy path.
+
+**Test receiver**
+
+A local-only configurable HTTP process that records a bounded in-memory list of
+exact body bytes, SHA-256 body digest, lower-cased headers, sequence, and receive
+time. It is inspection evidence, not a durable audit service or production
+receiver.
 
 **Liveness probe**
 
@@ -506,15 +597,23 @@ HookRelay executes a bounded `SELECT 1` and returns sanitized `503` on failure.
 
 **Request-size limit**
 
-A maximum number of bytes accepted for an HTTP request. Stage 2 has field-level
-and endpoint-count limits but no explicit whole-request byte limit; deployed
-ingress and application quotas remain required.
+A maximum number of bytes accepted for an HTTP request. Producer ingestion has
+field/count bounds but no complete product request-byte/quota policy; the local
+test receiver independently caps captured bodies. Stage 5 must define the
+production boundary.
+
+**End-to-end test**
+
+A test that crosses API, PostgreSQL, outbox publisher, JetStream, worker, and
+receiver boundaries. It proves the tested happy path interoperates, not every
+failure schedule, production security, HA, or scale.
 
 **Test marker**
 
-Pytest metadata for selecting suites. `integration` requires real PostgreSQL;
+Pytest metadata for selecting suites. `integration` requires real services;
 `concurrency` highlights overlapping operations; `security` highlights
-authentication, isolation, encryption, and redaction behavior.
+authentication/isolation/redaction; `nats` and `e2e` identify Stage 3 broker and
+full-path coverage.
 
 **Unit test**
 

@@ -119,3 +119,80 @@ def test_encryption_key_requires_canonical_url_safe_base64() -> None:
 def test_encryption_key_version_is_a_positive_small_integer(version: int) -> None:
     with pytest.raises(ValidationError):
         Settings(secret_encryption_key_version=version, _env_file=None)
+
+
+def test_nats_credentials_are_masked_and_asset_names_are_versioned() -> None:
+    password = "nats-password-not-for-logs"
+    settings = Settings(
+        nats_url=f"nats://worker:{password}@broker:4222",
+        _env_file=None,
+    )
+
+    assert password not in repr(settings)
+    assert settings.nats_server_url().endswith("@broker:4222")
+    assert settings.nats_stream_name.endswith("_V1")
+    assert settings.nats_subject.endswith(".v1")
+    assert settings.nats_consumer_name.endswith("_V1")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("nats_url", "https://broker.example"),
+        ("nats_url", "nats://broker.example/path"),
+        ("nats_stream_name", "bad.stream"),
+        ("nats_consumer_name", "bad consumer"),
+        ("nats_subject", "hookrelay.delivery.*"),
+    ],
+)
+def test_nats_configuration_rejects_ambiguous_assets(field: str, value: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings.model_validate({field: value})
+
+
+def test_worker_backpressure_and_timeout_budgets_must_align() -> None:
+    with pytest.raises(ValidationError, match="nats_max_ack_pending"):
+        Settings(
+            delivery_worker_concurrency=9,
+            nats_max_ack_pending=8,
+            _env_file=None,
+        )
+    with pytest.raises(ValidationError, match="nats_ack_wait_seconds"):
+        Settings(
+            delivery_http_timeout_seconds=10,
+            nats_ack_wait_seconds=14,
+            _env_file=None,
+        )
+    with pytest.raises(ValidationError, match="publish-timeout budget"):
+        Settings(
+            outbox_batch_size=25,
+            nats_publish_timeout_seconds=3,
+            outbox_claim_ttl_seconds=60,
+            _env_file=None,
+        )
+
+
+def test_stage3_worker_is_gated_to_explicit_local_test_hosts() -> None:
+    settings = Settings(
+        environment="test",
+        delivery_allowed_hosts=frozenset({" Receiver ", "LOCALHOST."}),
+        _env_file=None,
+    )
+
+    settings.require_stage3_delivery_runtime()
+    assert settings.delivery_allowed_hosts == frozenset({"receiver", "localhost"})
+
+    production = Settings(
+        environment="production",
+        secret_encryption_key=base64.urlsafe_b64encode(b"P" * 32).decode("ascii"),
+        _env_file=None,
+    )
+    with pytest.raises(RuntimeError, match="restricted to local and test"):
+        production.require_stage3_delivery_runtime()
+
+
+def test_delivery_host_allowlist_rejects_empty_and_wildcard_values() -> None:
+    with pytest.raises(ValidationError):
+        Settings(delivery_allowed_hosts=frozenset(), _env_file=None)
+    with pytest.raises(ValidationError):
+        Settings(delivery_allowed_hosts=frozenset({"*"}), _env_file=None)

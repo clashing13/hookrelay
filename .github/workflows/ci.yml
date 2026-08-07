@@ -21,6 +21,8 @@ jobs:
       HOOKRELAY_ENVIRONMENT: test
       HOOKRELAY_DATABASE_URL: postgresql+asyncpg://hookrelay:hookrelay-ci-only@127.0.0.1:5432/hookrelay_test
       HOOKRELAY_TEST_DATABASE_URL: postgresql+asyncpg://hookrelay:hookrelay-ci-only@127.0.0.1:5432/hookrelay_test
+      HOOKRELAY_NATS_URL: nats://127.0.0.1:4222
+      HOOKRELAY_TEST_NATS_URL: nats://127.0.0.1:4222
 
     services:
       postgres:
@@ -46,6 +48,21 @@ jobs:
         with:
           python-version: 3.12.13
 
+      - name: Start NATS 2.14.3 with file-backed JetStream
+        run: |
+          docker run --detach --name hookrelay-ci-nats \
+            --publish 4222:4222 --publish 8222:8222 \
+            nats:2.14.3-alpine3.22 -js -sd /data -m 8222
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent \
+              'http://127.0.0.1:8222/healthz?js-enabled-only=true' >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs hookrelay-ci-nats
+          exit 1
+
       - name: Install uv 0.12.1
         run: python -m pip install --disable-pip-version-check uv==0.12.1
 
@@ -69,6 +86,8 @@ jobs:
 
       - name: Validate migration downgrade and re-upgrade
         run: |
+          uv run alembic downgrade 20260802_0001
+          uv run alembic upgrade head
           uv run alembic downgrade base
           uv run alembic upgrade head
 
@@ -84,4 +103,8 @@ jobs:
       - name: Validate Compose and build the image
         run: |
           docker compose config --quiet
-          docker build --pull --tag hookrelay:ci .
+          docker build --pull --tag hookrelay:stage3-ci .
+
+      - name: Show NATS logs on failure
+        if: failure()
+        run: docker logs hookrelay-ci-nats

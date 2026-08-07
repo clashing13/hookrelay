@@ -12,7 +12,7 @@ async def test_liveness_contract(client: AsyncClient) -> None:
     assert response.json() == {
         "status": "ok",
         "service": "hookrelay",
-        "version": "0.2.0",
+        "version": "0.3.0",
     }
 
 

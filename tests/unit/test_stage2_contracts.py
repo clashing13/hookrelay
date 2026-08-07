@@ -6,12 +6,8 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 
-from hookrelay.ingestion import (
-    OUTBOX_SCHEMA_VERSION,
-    OUTBOX_TOPIC,
-    build_outbox_messages,
-    request_fingerprint,
-)
+from hookrelay.broker import OUTBOX_SCHEMA_VERSION, OUTBOX_TOPIC
+from hookrelay.ingestion import build_outbox_messages, request_fingerprint
 from hookrelay.models import Delivery
 from hookrelay.schemas import (
     DeliveryDetailResponse,

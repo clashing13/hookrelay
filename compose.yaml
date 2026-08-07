@@ -1,22 +1,47 @@
 name: hookrelay
 
+x-hookrelay-image: &hookrelay-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: hookrelay-api:stage3
+
+x-hookrelay-runtime-environment: &hookrelay-runtime-environment
+  HOOKRELAY_ENVIRONMENT: local
+  HOOKRELAY_LOG_LEVEL: ${HOOKRELAY_LOG_LEVEL:-INFO}
+  HOOKRELAY_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-hookrelay}:${POSTGRES_PASSWORD:-hookrelay-dev-only}@postgres:5432/${POSTGRES_DB:-hookrelay}
+  HOOKRELAY_DATABASE_POOL_SIZE: ${HOOKRELAY_DATABASE_POOL_SIZE:-5}
+  HOOKRELAY_DATABASE_MAX_OVERFLOW: ${HOOKRELAY_DATABASE_MAX_OVERFLOW:-10}
+  HOOKRELAY_READINESS_TIMEOUT_SECONDS: ${HOOKRELAY_READINESS_TIMEOUT_SECONDS:-2}
+  HOOKRELAY_SECRET_ENCRYPTION_KEY: ${HOOKRELAY_SECRET_ENCRYPTION_KEY:-MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=}
+  HOOKRELAY_SECRET_ENCRYPTION_KEY_VERSION: ${HOOKRELAY_SECRET_ENCRYPTION_KEY_VERSION:-1}
+  HOOKRELAY_NATS_URL: nats://nats:4222
+  HOOKRELAY_NATS_STREAM_NAME: ${HOOKRELAY_NATS_STREAM_NAME:-HOOKRELAY_DELIVERIES_V1}
+  HOOKRELAY_NATS_SUBJECT: ${HOOKRELAY_NATS_SUBJECT:-hookrelay.delivery.requested.v1}
+  HOOKRELAY_NATS_CONSUMER_NAME: ${HOOKRELAY_NATS_CONSUMER_NAME:-HOOKRELAY_DELIVERY_WORKERS_V1}
+  HOOKRELAY_NATS_CONNECT_TIMEOUT_SECONDS: ${HOOKRELAY_NATS_CONNECT_TIMEOUT_SECONDS:-2}
+  HOOKRELAY_NATS_DRAIN_TIMEOUT_SECONDS: ${HOOKRELAY_NATS_DRAIN_TIMEOUT_SECONDS:-5}
+  HOOKRELAY_NATS_PUBLISH_TIMEOUT_SECONDS: ${HOOKRELAY_NATS_PUBLISH_TIMEOUT_SECONDS:-2}
+  HOOKRELAY_NATS_DUPLICATE_WINDOW_SECONDS: ${HOOKRELAY_NATS_DUPLICATE_WINDOW_SECONDS:-600}
+  HOOKRELAY_NATS_STREAM_MAX_BYTES: ${HOOKRELAY_NATS_STREAM_MAX_BYTES:-1073741824}
+  HOOKRELAY_NATS_ACK_WAIT_SECONDS: ${HOOKRELAY_NATS_ACK_WAIT_SECONDS:-30}
+  HOOKRELAY_NATS_ACK_TIMEOUT_SECONDS: ${HOOKRELAY_NATS_ACK_TIMEOUT_SECONDS:-2}
+  HOOKRELAY_NATS_MAX_ACK_PENDING: ${HOOKRELAY_NATS_MAX_ACK_PENDING:-32}
+  HOOKRELAY_OUTBOX_BATCH_SIZE: ${HOOKRELAY_OUTBOX_BATCH_SIZE:-25}
+  HOOKRELAY_OUTBOX_POLL_INTERVAL_SECONDS: ${HOOKRELAY_OUTBOX_POLL_INTERVAL_SECONDS:-0.25}
+  HOOKRELAY_OUTBOX_CLAIM_TTL_SECONDS: ${HOOKRELAY_OUTBOX_CLAIM_TTL_SECONDS:-60}
+  HOOKRELAY_DELIVERY_WORKER_CONCURRENCY: ${HOOKRELAY_DELIVERY_WORKER_CONCURRENCY:-8}
+  HOOKRELAY_DELIVERY_FETCH_TIMEOUT_SECONDS: ${HOOKRELAY_DELIVERY_FETCH_TIMEOUT_SECONDS:-1}
+  HOOKRELAY_DELIVERY_HTTP_TIMEOUT_SECONDS: ${HOOKRELAY_DELIVERY_HTTP_TIMEOUT_SECONDS:-10}
+  HOOKRELAY_DELIVERY_ALLOWED_HOSTS: '${HOOKRELAY_DELIVERY_ALLOWED_HOSTS:-["receiver","127.0.0.1","localhost"]}'
+
 services:
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: hookrelay-api:stage2
+    <<: *hookrelay-image
     environment:
-      HOOKRELAY_ENVIRONMENT: local
-      HOOKRELAY_LOG_LEVEL: ${HOOKRELAY_LOG_LEVEL:-INFO}
+      <<: *hookrelay-runtime-environment
       HOOKRELAY_HOST: 0.0.0.0
       HOOKRELAY_PORT: "8000"
-      HOOKRELAY_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-hookrelay}:${POSTGRES_PASSWORD:-hookrelay-dev-only}@postgres:5432/${POSTGRES_DB:-hookrelay}
-      HOOKRELAY_DATABASE_POOL_SIZE: ${HOOKRELAY_DATABASE_POOL_SIZE:-5}
-      HOOKRELAY_DATABASE_MAX_OVERFLOW: ${HOOKRELAY_DATABASE_MAX_OVERFLOW:-10}
-      HOOKRELAY_READINESS_TIMEOUT_SECONDS: ${HOOKRELAY_READINESS_TIMEOUT_SECONDS:-2}
-      HOOKRELAY_SECRET_ENCRYPTION_KEY: ${HOOKRELAY_SECRET_ENCRYPTION_KEY:-MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=}
-      HOOKRELAY_SECRET_ENCRYPTION_KEY_VERSION: ${HOOKRELAY_SECRET_ENCRYPTION_KEY_VERSION:-1}
       HOOKRELAY_BOOTSTRAP_ENABLED: ${HOOKRELAY_BOOTSTRAP_ENABLED:-true}
       HOOKRELAY_BOOTSTRAP_TOKEN: ${HOOKRELAY_BOOTSTRAP_TOKEN:-hookrelay-local-bootstrap-token-change-me}
     ports:
@@ -33,6 +58,63 @@ services:
       interval: 10s
       timeout: 3s
       retries: 3
+      start_period: 5s
+    init: true
+    stop_grace_period: 10s
+
+  outbox-publisher:
+    <<: *hookrelay-image
+    command: ["hookrelay-outbox"]
+    environment:
+      <<: *hookrelay-runtime-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    init: true
+    stop_grace_period: 10s
+
+  worker:
+    <<: *hookrelay-image
+    command: ["hookrelay-worker"]
+    environment:
+      <<: *hookrelay-runtime-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      receiver:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    init: true
+    # Default budget: up to 10s HTTP + 5s NATS drain + shutdown margin.
+    stop_grace_period: 25s
+
+  receiver:
+    <<: *hookrelay-image
+    command: ["hookrelay-test-receiver"]
+    environment:
+      HOOKRELAY_RECEIVER_HOST: 0.0.0.0
+      HOOKRELAY_RECEIVER_PORT: "9000"
+      HOOKRELAY_RECEIVER_RESPONSE_STATUS_CODE: ${HOOKRELAY_RECEIVER_RESPONSE_STATUS_CODE:-204}
+      HOOKRELAY_RECEIVER_DELAY_SECONDS: ${HOOKRELAY_RECEIVER_DELAY_SECONDS:-0}
+      HOOKRELAY_RECEIVER_MAX_CAPTURED_REQUESTS: ${HOOKRELAY_RECEIVER_MAX_CAPTURED_REQUESTS:-1000}
+    ports:
+      - "127.0.0.1:${RECEIVER_HOST_PORT:-9000}:9000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health/live', timeout=2).close()
+      interval: 5s
+      timeout: 3s
+      retries: 10
       start_period: 5s
     init: true
     stop_grace_period: 10s
@@ -59,5 +141,25 @@ services:
       start_period: 5s
     stop_grace_period: 30s
 
+  nats:
+    # Pin the exact NATS and Alpine releases; JetStream uses the named volume.
+    image: nats:2.14.3-alpine3.22
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:${NATS_HOST_PORT:-4222}:4222"
+      - "127.0.0.1:${NATS_MONITOR_HOST_PORT:-8222}:8222"
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget --quiet --spider 'http://127.0.0.1:8222/healthz?js-enabled-only=true'
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    stop_grace_period: 30s
+
 volumes:
   postgres_data:
+  nats_data:
