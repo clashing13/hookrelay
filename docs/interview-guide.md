@@ -4,7 +4,19 @@ This guide turns the implemented system into precise interview explanations.
 Lead with an invariant and evidence, then state the boundary. Avoid reciting a
 tool list or claiming roadmap behavior as complete.
 
-## Thirty-second Stage 5 pitch
+## Thirty-second Stage 6 pitch
+
+> HookRelay `0.6.0` accepts tenant-authenticated, byte-bounded events
+> idempotently, commits dispatch intent in PostgreSQL, and delivers ID-only
+> commands through NATS JetStream with durable retry, traffic, and destination
+> controls. Stage 6 preserves correlation and W3C trace context across the
+> outbox, exposes bounded Prometheus metrics and optional OpenTelemetry traces,
+> and adds tenant-safe delivery/attempt history plus a same-origin operations
+> console. PostgreSQL remains authoritative, telemetry remains expendable, and
+> delivery remains at least once; the local stack does not claim production
+> IAM, SLOs, HA, capacity, egress isolation, or complete audit history.
+
+### Historical Stage 5 pitch
 
 > HookRelay `0.5.0` accepts tenant-authenticated, byte-bounded events
 > idempotently and commits dispatch intent in PostgreSQL before publishing an
@@ -38,8 +50,9 @@ tool list or claiming roadmap behavior as complete.
    canonical versioned request and uses a tenant/key unique constraint plus
    PostgreSQL `ON CONFLICT` to make retries safe across concurrent API replicas.
 7. The successful transaction creates one event, one pending delivery per
-   endpoint, and one generation-1 outbox row per delivery. Only after commit
-   does the route return `201`.
+   endpoint, and one generation-1 outbox row per delivery. That row also
+   preserves the accepting correlation UUID and optional canonical
+   `traceparent`. Only after commit does the route return `201`.
 8. A separate publisher leases eligible outbox rows in short PostgreSQL
    transactions, publishes ID-only commands to a file-backed JetStream stream,
    waits for PubAck, then conditionally records `published_at`.
@@ -64,6 +77,18 @@ tool list or claiming roadmap behavior as complete.
 15. HookRelay's own containers run non-root with read-only filesystems, dropped
     capabilities, `no-new-privileges`, PID ceilings, and restricted `/tmp`; the
     PostgreSQL and NATS images retain service-specific profiles.
+16. Pure ASGI correlation middleware, structured JSON logs, and explicit spans
+    connect API, publisher, broker, worker, and HTTP-attempt evidence. NATS
+    headers carry observability context while the schema-v1 JSON body remains
+    unchanged; telemetry export failure never changes product correctness or
+    readiness.
+17. API, publisher, and worker own separate Prometheus registries with bounded
+    labels. The optional Compose profile adds Collector, Prometheus, Tempo, and
+    provisioned Grafana; those processes are diagnostic, not authoritative.
+18. Tenant APIs expose filtered reverse-keyset delivery pages, safe current
+    detail, and lifetime attempt history. The same-origin `/console/` keeps the
+    tenant key only in memory and reuses expected-generation replay after an
+    explicit operator confirmation.
 
 ## Whiteboard trace
 
@@ -79,10 +104,10 @@ Producer
   -> PostgreSQL transaction
        event
        + N pending delivery snapshots
-       + N unpublished outbox rows
+       + N unpublished outbox rows with correlation/trace context
   -> commit
   -> 201 Created
-  -> outbox lease -> JetStream PubAck -> published_at
+  -> outbox lease -> NATS observability headers -> JetStream PubAck -> published_at
   -> durable pull consumer -> bounded worker
   -> PostgreSQL endpoint traffic row
        -> rate/circuit/probe deferral -> due time + delayed NAK, no attempt
@@ -99,6 +124,16 @@ Operator -> POST /v1/deliveries/{id}/replay
 
 Operator -> POST /v1/endpoints/{id}/signing-secret/rotate
          -> expected active version -> retire old + create new -> 200
+
+Operator -> same-origin /console/
+         -> GET /v1/deliveries?filters&cursor=...
+         -> GET safe delivery + immutable attempt history
+         -> confirmed replay uses observed generation; key stays in memory
+
+API / publisher / worker
+  -> structured JSON logs + explicit spans + bounded-label metrics
+  -> optional Collector / Tempo + Prometheus / Grafana
+  -> telemetry outage does not change product work or PostgreSQL readiness
 
 Ambiguity: PubAck before outbox finalization; receiver action before
 HookRelay success certainty. Stable IDs + idempotency, not exactly once.
@@ -616,6 +651,100 @@ Primary references: the
 [ADR 0017](decisions/0017-versioned-signing-secret-rotation.md), and
 [ADR 0018](decisions/0018-least-privilege-app-containers.md).
 
+## Stage 6 observability and operations questions
+
+### Why use logs, metrics, and traces instead of choosing one?
+
+- Structured logs explain discrete decisions and sanitized failures and are
+  searchable by a correlation ID.
+- Metrics answer aggregate rate, backlog, latency-bucket, and outcome questions
+  cheaply, but deliberately omit high-cardinality delivery/endpoint identity.
+- Traces connect causally related operations across the API, outbox publisher,
+  NATS, worker, and destination boundaries and expose where time was spent.
+- None is product truth. PostgreSQL delivery and attempt rows decide state; the
+  three telemetry signals help an operator form and test a hypothesis.
+
+### How does trace context survive the transactional outbox?
+
+- Request middleware establishes a canonical correlation UUID and accepts or
+  starts W3C trace context.
+- Event acceptance persists the correlation UUID and optional validated
+  canonical `traceparent` on each outbox row in the same product transaction.
+- The publisher extracts that persisted parent, creates a publish span, and
+  sends correlation/trace values as NATS headers. The worker extracts them and
+  creates its consumer/attempt spans.
+- The strict schema-v1 JSON broker body remains ID-only. Context is durable
+  enough to cross delay/restart without turning observability data into domain
+  payload or authorization.
+
+### Why are telemetry systems excluded from readiness and correctness?
+
+- Accepting, publishing, retrying, and finalizing work rely on PostgreSQL (and
+  NATS where that process needs it), not on a trace or dashboard write.
+- Blocking those paths on Collector, Tempo, Prometheus, or Grafana would let a
+  diagnostic outage create a product outage and could amplify failure.
+- Export is disabled by default and bounded when enabled. Export/scrape failure
+  is reported best-effort, while readiness remains a bounded PostgreSQL probe.
+- This isolation also means missing telemetry cannot be interpreted as proof
+  that no delivery or side effect occurred.
+
+### How is Prometheus cardinality kept bounded?
+
+- API, publisher, and worker use explicit process-local registries; publisher
+  and worker expose internal `:9101/metrics` and `:9102/metrics` listeners,
+  while the API serves `/metrics`.
+- Labels come from finite enums/categories such as operation, outcome, or
+  broker disposition. Delivery IDs, endpoint IDs, tenant IDs, URLs, event
+  types, correlation IDs, and free-form exceptions are excluded.
+- Process-local counters are not a shared correctness primitive. Prometheus
+  aggregates scrape targets; PostgreSQL remains the cross-replica source of
+  truth.
+
+### Why keyset pagination, and how is tenant isolation preserved?
+
+- Offset pages can duplicate or omit rows as new deliveries arrive. Delivery
+  pages instead order by `(created_at DESC, id DESC)`; attempt pages order by
+  lifetime attempt number descending with ID as a tie-breaker.
+- A versioned base64url cursor carries only the next ordered position and a
+  filter fingerprint. Reusing it under a different route/filter returns `422`.
+- The cursor is not authorization. Every list/detail query still derives the
+  tenant from the verified API key and includes the tenant predicate;
+  missing/cross-tenant resources share opaque `404` behavior.
+
+### What exactly does the history API expose?
+
+- `GET /v1/deliveries` lists safe current state with optional `status`,
+  `endpoint_id`, and `event_id` filters plus `limit`/`cursor`.
+- `GET /v1/deliveries/{delivery_id}` returns safe current delivery detail;
+  `/attempts` and `/attempts/{attempt_id}` expose immutable lifetime attempt
+  evidence across dispatch generations.
+- Models omit tenant IDs, payloads, target URLs, secret references/ciphertext,
+  claim tokens, broker envelopes, and free-form exception text, and inspection
+  responses are `no-store`.
+- It is not event sourcing: former state transitions, traffic deferrals, stale
+  broker observations, and replay actor/audit identity are not all persisted.
+
+### How does the console handle credentials and replay safely?
+
+- The React bundle is served under `/console/` by the same API and calls fixed
+  relative `/v1` routes; no broad CORS setup or configurable arbitrary API
+  origin is needed.
+- The tenant API key is held only in JavaScript memory. It is never placed in a
+  URL, local/session storage, or logs, and refresh/sign-out clears it.
+- The console can only do what that tenant key can do. It inspects server state,
+  requires explicit confirmation, and sends the currently observed
+  `expected_dispatch_generation`; `404`/`409` remain authoritative.
+- CSP, `nosniff`, no-referrer, and frame-denial headers reduce browser attack
+  surface. They do not provide production identity, RBAC, CSRF/audit workflow,
+  or TLS.
+
+Primary references: the
+[Stage 6 guide](stages/06-observability-operations-console.md),
+[ADR 0019](decisions/0019-outbox-preserved-observability-context.md),
+[ADR 0020](decisions/0020-bounded-process-local-metrics.md),
+[ADR 0021](decisions/0021-tenant-keyset-delivery-history.md), and
+[ADR 0022](decisions/0022-same-origin-memory-only-operations-console.md).
+
 ## Security and limitation questions
 
 ### Does requiring `HttpUrl` or HTTPS solve SSRF?
@@ -664,6 +793,43 @@ Primary references: the
   of the threat model.
 
 ## Test-evidence questions
+
+### How do you know Stage 6 works?
+
+Name evidence by boundary, not by tool count:
+
+- `tests/unit/test_stage6_observability.py` covers canonical correlation
+  behavior, structured log context, W3C propagation, span relationships,
+  bounded metric labels, process-local registries/listeners, and telemetry
+  failure isolation.
+- `tests/api/test_stage6_operations.py` covers authenticated history filters,
+  stable cursor contracts, safe response shapes, cross-tenant opacity, attempt
+  detail, and replay validation through the HTTP surface.
+- `tests/integration/test_stage6_operations.py` uses real PostgreSQL for equal-
+  timestamp keyset ordering, tenant-safe delivery/attempt lookup, and replay
+  that retains prior attempt evidence across generations.
+- `tests/unit/test_stage6_console.py` verifies optional static mounting and the
+  same-origin security-header/route boundary. `web/src/App.test.tsx` exercises
+  in-memory login, filtering, pagination, inspection, error handling, and
+  confirmed replay behavior.
+- `web/e2e/console.spec.ts` drives Playwright against a seeded real API for
+  browser inspection and deliberately seeded replay. The test requires the
+  explicit local bootstrap token or pre-created IDs; it does not silently
+  target an arbitrary tenant.
+- Migration `20260806_0005` adds outbox context and history indexes; migration
+  round trips and `alembic check` cover schema/model alignment. Compose profile
+  validation, provisioned dashboards/data sources, and the multi-stage image
+  build cover local packaging.
+
+The exact fast commands are `pytest -m "not integration"`,
+`pnpm --dir web run typecheck`, `pnpm --dir web run test`, and
+`pnpm --dir web run build`; real-service evidence adds the integration markers,
+`alembic check`, and the explicitly seeded `pnpm --dir web run test:e2e`.
+
+Then state the limit: telemetry tests do not prove that every signal arrives;
+a trace does not prove receiver success; a provisioned dashboard is not an SLO
+or production alerting system; one PostgreSQL pagination schedule is not a load
+test; and an in-memory-key console is not production IAM, RBAC, or audit.
 
 ### How do you know Stage 5 works?
 
@@ -780,6 +946,15 @@ defense, broker behavior, or receiver compatibility.
 - For crash ambiguity, delay the local receiver, save its first capture, kill
   the disposable worker, and observe abandoned-attempt recovery after the
   database lease expires.
+- Stop only `otel-collector`, submit another local event, and show that the API
+  still commits, readiness remains PostgreSQL-backed, and delivery proceeds;
+  the absent trace is expected diagnostic loss, not product rollback.
+- Use equal-timestamp seeded deliveries to page with `next_cursor` and verify no
+  duplicate/gap; try another tenant's delivery/attempt ID and observe the same
+  opaque `404` as a missing ID.
+- In `/console/`, show that refresh discards the in-memory tenant key and that a
+  deliberately stale replay generation receives `409` instead of silently
+  advancing work.
 - Never delete named volumes or send the exercise to a real third party.
 
 ## Recruiter-oriented story prompts
@@ -821,6 +996,8 @@ Use one concrete loop:
 - **Rollback:** injected outbox failure leaves no event or delivery residue.
 - **Dependency outage:** readiness becomes `503` while liveness remains `200`
   and later recovers.
+- **Telemetry outage:** stop the Collector; product transactions and
+  PostgreSQL-backed readiness continue while trace export is best-effort.
 - **Broker outage:** the API still commits an outbox row while NATS is stopped;
   after restart the publisher drains it and the local receiver gets the event.
 - **Ambiguous ACK:** a duplicated broker message observes `succeeded`, skips a
@@ -842,6 +1019,10 @@ Use one concrete loop:
   while older deliveries continue to reference their original secret row.
 - **Replay:** expected generation, tenant scope, and row locking produce one
   fresh outbox UUID without erasing earlier attempts.
+- **History concurrency:** equal-timestamp keyset pages use UUID tie-breakers,
+  filter-bound cursors reject changed context, and cross-tenant IDs stay opaque.
+- **Console stale intent:** an observed generation changed before confirmation,
+  so replay returns `409` and the UI refreshes from authoritative state.
 - **Real process death:** kill a separate worker after receiver capture, then
   observe expired-claim abandonment and replacement-worker recovery with the
   same body.
@@ -850,12 +1031,13 @@ For each, say what was observed and one thing the exercise cannot prove.
 
 ### “What would you build next?”
 
-Stage 6 should add telemetry, history APIs, and the operations console without
-weakening the tenant and secret-redaction boundaries. Stage 7 should expand the
-single Stage 4 subprocess-kill schedule into a broader DNS/TLS/process fault
-matrix and add load, soak, HA, fairness, and capacity evidence. Production work
-also needs external egress policy, ingress/tenant quotas, and a safe master-key
-keyring/rewrap lifecycle; Stage 5 intentionally does not claim those outcomes.
+Stage 7 should expand the current deterministic and single-process-kill
+evidence into a broader DNS/TLS/process fault matrix, then add k6/Toxiproxy
+load, soak, percentile, fairness, recovery, and release evidence. Production
+work also needs real identity/RBAC and audit, TLS, external egress policy,
+ingress/tenant quotas, alert/SLO design, HA/backup/restore, and a safe
+master-key keyring/rewrap lifecycle. Stage 6 observability and the local console
+make failures easier to inspect; they do not claim those outcomes.
 
 ## Claims to avoid
 
@@ -897,12 +1079,42 @@ keyring/rewrap lifecycle; Stage 5 intentionally does not claim those outcomes.
 - “A traffic-control deferral is an HTTP attempt.”
 - “Endpoint signing-secret rotation also rotates the AES master key.”
 - “Non-root and read-only containers are a complete security boundary.”
+- “A trace or metric proves that the webhook was delivered.”
+- “A telemetry outage should make product readiness fail.”
+- “Delivery, endpoint, tenant, or correlation IDs are useful metric labels.”
+- “The history cursor's tenant or filter data authorizes the request.”
+- “The history API is event sourcing or a complete audit trail.”
+- “Storing the tenant API key in browser local storage is safe enough.”
+- “A provisioned Grafana dashboard proves production monitoring or an SLO.”
+- “The operations console provides production IAM, RBAC, or actor audit.”
 - “HMAC encrypts the webhook body.”
 - “A timestamp alone prevents replay.”
 - “Async means the worker has unlimited concurrency.”
 - “The happy-path test proves production scale.”
 
-## Three-to-five-minute Stage 5 teach-back
+## Three-to-five-minute Stage 6 teach-back
+
+Aim for this timing:
+
+1. **0:00-0:35 — Boundary:** Stage 6 adds diagnostic and operator surfaces
+   without moving correctness out of PostgreSQL or changing at-least-once
+   delivery.
+2. **0:35-1:15 — Context:** canonical correlation, request spans, outbox
+   correlation/`traceparent`, NATS headers, and unchanged schema-v1 JSON.
+3. **1:15-2:00 — Signals:** structured safe logs, bounded-label process-local
+   metrics, explicit spans, and why each answers a different question.
+4. **2:00-2:35 — Isolation:** optional OTLP/HTTP export, Collector/Tempo and
+   Prometheus/Grafana, with PostgreSQL-only API readiness and best-effort
+   telemetry.
+5. **2:35-3:25 — History:** tenant predicates, safe schemas, delivery/attempt
+   routes, stable keyset ordering, and opaque filter-bound cursors.
+6. **3:25-4:15 — Console:** same origin, memory-only key, no-store responses,
+   explicit replay confirmation, and expected-generation conflict behavior.
+7. **4:15-5:00 — Evidence/boundaries:** name the Stage 6 Python/browser tests
+   and migration `20260806_0005`; deny event-sourcing, audit, SLO, IAM, HA,
+   capacity, and exactly-once claims.
+
+## Historical Stage 5 teach-back
 
 Aim for this timing:
 

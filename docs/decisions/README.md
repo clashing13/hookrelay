@@ -24,6 +24,10 @@ reasoning remains useful.
 | [0016](0016-request-byte-limits-before-parsing.md) | Enforce raw request byte limits before routing and parsing | Accepted |
 | [0017](0017-versioned-signing-secret-rotation.md) | Rotate endpoint signing secrets by immutable version and delivery snapshot | Accepted |
 | [0018](0018-least-privilege-app-containers.md) | Run application containers with a least-privilege baseline | Accepted |
+| [0019](0019-outbox-preserved-observability-context.md) | Preserve correlation and W3C trace context beside the strict outbox payload | Accepted |
+| [0020](0020-bounded-process-local-metrics.md) | Use process-local Prometheus registries with bounded label vocabularies | Accepted |
+| [0021](0021-tenant-keyset-delivery-history.md) | Use tenant-scoped deterministic keyset pagination for operations history | Accepted |
+| [0022](0022-same-origin-memory-only-operations-console.md) | Serve a same-origin console with memory-only bearer credentials | Accepted |
 
 Stage 5 adds connection-time outbound destination enforcement, shared endpoint
 traffic controls, bounded request bodies, endpoint signing-secret rotation, and
@@ -32,3 +36,7 @@ security controls, retries, claim fencing, PubAck deduplication, and
 success-state suppression do not make a remote receiver exactly once. PostgreSQL
 tenant filters are application-enforced in Stage 5; database row-level security and
 production egress firewalling remain future defense-in-depth work.
+
+Stage 6 adds a failure-isolated observability plane and tenant operations view.
+These decisions do not promote telemetry to a source of truth: PostgreSQL remains
+authoritative and the strict broker/webhook contracts remain unchanged.
