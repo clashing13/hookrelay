@@ -12,6 +12,8 @@ from hookrelay.broker import DeliveryRequestedMessage, JetStreamBroker, decode_d
 from hookrelay.config import Settings, get_settings
 from hookrelay.database import PostgresDatabase
 from hookrelay.delivery import (
+    DeliveryClaimLost,
+    DeliveryExecutionResult,
     DeliveryExecutor,
     DeliveryMessageRejected,
     DeliveryTargetBlocked,
@@ -33,6 +35,9 @@ class DeliveryBrokerMessage(Protocol):
     async def in_progress(self) -> None:
         """Extend the acknowledgment deadline for an already-active attempt."""
 
+    async def nak(self, delay: float | None = None) -> None:
+        """Request redelivery after an optional server-side delay."""
+
     async def term(self) -> None:
         """Stop redelivery of an internally malformed poison message."""
 
@@ -53,7 +58,7 @@ class PullSubscription(Protocol):
 class DeliveryExecutorProtocol(Protocol):
     """Execute one validated durable delivery command."""
 
-    async def execute(self, message: DeliveryRequestedMessage) -> str:
+    async def execute(self, message: DeliveryRequestedMessage) -> DeliveryExecutionResult:
         """Return the acknowledgement decision for the broker message."""
 
 
@@ -66,6 +71,38 @@ class DeliveryWorker:
         self._semaphore = asyncio.Semaphore(settings.delivery_worker_concurrency)
         self._logger = logging.getLogger("hookrelay.worker")
 
+    async def _ack(self, broker_message: DeliveryBrokerMessage, delivery_id: str) -> None:
+        try:
+            await broker_message.ack_sync(self._settings.nats_ack_timeout_seconds)
+        except Exception as exc:
+            self._logger.warning(
+                "delivery_ack_failed",
+                extra={"delivery_id": delivery_id, "error_type": type(exc).__name__},
+            )
+
+    async def _nak(
+        self,
+        broker_message: DeliveryBrokerMessage,
+        delay_seconds: float,
+        delivery_id: str,
+    ) -> None:
+        try:
+            await broker_message.nak(delay_seconds)
+        except Exception as exc:
+            self._logger.warning(
+                "delivery_nak_failed",
+                extra={"delivery_id": delivery_id, "error_type": type(exc).__name__},
+            )
+
+    async def _term(self, broker_message: DeliveryBrokerMessage, delivery_id: str | None) -> None:
+        try:
+            await broker_message.term()
+        except Exception as exc:
+            self._logger.warning(
+                "delivery_term_failed",
+                extra={"delivery_id": delivery_id, "error_type": type(exc).__name__},
+            )
+
     async def process_message(self, broker_message: DeliveryBrokerMessage) -> None:
         """Validate, execute, and ACK only after PostgreSQL records success."""
 
@@ -74,26 +111,54 @@ class DeliveryWorker:
                 message = decode_delivery_message(broker_message.data)
             except ValidationError:
                 self._logger.error("delivery_message_invalid")
-                await broker_message.term()
+                await self._term(broker_message, None)
                 return
 
             try:
                 result = await self._executor.execute(message)
-                if result in {"succeeded", "already_succeeded"}:
-                    await broker_message.ack_sync(self._settings.nats_ack_timeout_seconds)
-                elif result == "in_progress":
-                    await broker_message.in_progress()
+                if result.state in {
+                    "succeeded",
+                    "already_succeeded",
+                    "dead_lettered",
+                    "stale",
+                }:
+                    await self._ack(broker_message, str(message.delivery_id))
                 else:
+                    if result.retry_after_seconds is None:
+                        raise RuntimeError("retry disposition is missing its delay")
+                    await self._nak(
+                        broker_message,
+                        result.retry_after_seconds,
+                        str(message.delivery_id),
+                    )
                     self._logger.warning(
-                        "delivery_attempt_failed",
-                        extra={"delivery_id": str(message.delivery_id)},
+                        "delivery_redelivery_scheduled",
+                        extra={
+                            "delivery_id": str(message.delivery_id),
+                            "retry_after_seconds": result.retry_after_seconds,
+                            "state": result.state,
+                        },
                     )
             except DeliveryTargetBlocked as exc:
-                # This is a recoverable policy gate, not a malformed command. Leaving the
-                # message unacknowledged preserves it for a later allowlist/configuration
-                # change; Stage 4 will add explicit delayed-redelivery policy.
+                # This is a recoverable policy gate, not a malformed command. Delay it so
+                # a configuration mistake cannot create an AckWait redelivery storm.
                 self._logger.warning(
                     "delivery_target_blocked",
+                    extra={
+                        "delivery_id": str(message.delivery_id),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                await self._nak(
+                    broker_message,
+                    self._settings.delivery_policy_block_delay_seconds,
+                    str(message.delivery_id),
+                )
+            except DeliveryClaimLost as exc:
+                # A newer worker fenced this attempt. Do not let the stale broker handle
+                # ACK, TERM, or reschedule work now owned by that newer execution.
+                self._logger.warning(
+                    "delivery_claim_lost",
                     extra={
                         "delivery_id": str(message.delivery_id),
                         "error_type": type(exc).__name__,
@@ -107,7 +172,7 @@ class DeliveryWorker:
                         "error_type": type(exc).__name__,
                     },
                 )
-                await broker_message.term()
+                await self._term(broker_message, str(message.delivery_id))
             except Exception as exc:
                 self._logger.warning(
                     "delivery_processing_interrupted",
@@ -142,7 +207,7 @@ class DeliveryWorker:
 
 async def _run() -> None:
     settings = get_settings()
-    settings.require_stage3_delivery_runtime()
+    settings.require_delivery_runtime()
     configure_logging(settings)
     database = PostgresDatabase(settings)
     broker = JetStreamBroker(settings, client_name="hookrelay-worker")

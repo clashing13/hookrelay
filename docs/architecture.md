@@ -1,11 +1,11 @@
 # HookRelay architecture
 
-This document is cumulative through Stage 3 (`0.3.0`). It describes current
-behavior and labels roadmap work explicitly. A successful local demonstration
-is evidence of the implemented path, not evidence of exactly-once delivery,
+This document is cumulative through Stage 4 (`0.4.0`). It describes current
+behavior and labels roadmap work explicitly. HookRelay provides at-least-once
+delivery with persistent bounded recovery; it does not claim exactly once,
 high availability, production security, or benchmark scale.
 
-## Current system: Stage 3 durable delivery pipeline
+## Current system: Stage 4 failure recovery
 
 ```text
 Deployment operator                         Producer
@@ -13,152 +13,161 @@ Deployment operator                         Producer
         | bootstrap token                      | tenant API key
         v                                      v
 +-------------------------- FastAPI / Uvicorn ---------------------------+
-| tenant bootstrap | endpoint creation | idempotent event API | health  |
+| tenant bootstrap | endpoints | idempotent events | replay | health    |
 +--------------------------------+---------------------------------------+
                                  |
                                  | event + N delivery snapshots
-                                 | + N outbox rows, one transaction
+                                 | + N generation-1 outbox rows
+                                 | one PostgreSQL transaction
                                  v
-                         +-----------------+
-                         |   PostgreSQL    |
-                         | source of truth |
-                         +--^-----------^--+
-                            |           |
-              claim / mark  |           | load / attempt / finish
-                            |           |
-                    +-------+--+        |
-                    | outbox   |        |
-                    | publisher|        |
-                    +-----+----+        |
-                          |             |
-                          | ID-only     |
-                          v             |
-                 +----------------+     |
-                 | NATS JetStream |-----+
-                 | durable stream | durable pull
-                 +----------------+     |
-                                        v
-                              +------------------+
-                              | bounded delivery |
-                              | worker           |
-                              +--------+---------+
-                                       | HMAC-signed HTTP
-                                       v
-                              +------------------+
-                              | local receiver   |
-                              | exact-byte ledger|
-                              +------------------+
+             +---------------- PostgreSQL ----------------+
+             | source of truth                            |
+             | event / delivery / attempts / outbox       |
+             | generation / due time / claim / terminal   |
+             +--------^-------------------------^---------+
+                      |                         |
+             claim / publish / mark      claim / finish / recover
+                      |                         |
+              +-------+--------+                |
+              | outbox publisher|               |
+              +-------+--------+                |
+                      | strict ID-only schema v1 |
+                      v                          |
+              +-----------------+ durable pull  |
+              | NATS JetStream  |--------------+
+              | work queue      |               v
+              +-------^---------+       +------------------+
+                      |                 | bounded delivery |
+                      | delayed NAK     | worker           |
+                      +-----------------+--------+---------+
+                                                 | HMAC-signed HTTP
+                                                 v
+                                        +------------------+
+                                        | local receiver   |
+                                        | exact-byte ledger|
+                                        +------------------+
+
+dead_lettered -- authenticated replay transaction --> generation + 1
+               + fresh outbox UUID --> publisher --> JetStream
 ```
 
-The API, publisher, worker, and receiver are independent processes. A broker or
-receiver outage does not become a synchronous `POST /v1/events` dependency.
-The API's durable-acceptance transaction remains PostgreSQL-only.
+The API, publisher, worker, and receiver are independent processes. Broker,
+destination, or worker failure does not become a synchronous dependency of
+`POST /v1/events`. PostgreSQL remains the durable acceptance and recovery
+boundary.
 
 ## Runtime components and ownership
 
 | Component | Owns | Does not own |
 | --- | --- | --- |
-| FastAPI application | Authentication, tenant scope, validation, idempotent event acceptance, current-state reads, PostgreSQL readiness | Broker publication, delivery execution, migrations, NATS health |
-| PostgreSQL | Authoritative tenant, secret, event, delivery, attempt, and outbox state | Remote receiver side effects or NATS acknowledgment state |
-| Outbox publisher | Short expiring claims, ID-only JetStream publication, PubAck-before-finalize ordering | Event acceptance, HTTP delivery, retry scheduling |
-| NATS JetStream | Durable dispatch message and shared consumer acknowledgment cursor | Event bodies, endpoint URLs, secrets, final domain state |
-| Delivery worker | Durable pulls, authoritative reconciliation, attempt lifecycle, signing, timeout-bounded HTTP, ACK decision | Full retry/crash-recovery policy or production SSRF defense |
-| Test receiver | Configurable local response and bounded exact-byte/header capture | Signature trust enforcement, durable audit storage, customer behavior |
-| SQLAlchemy async engine | One connection pool per database-using process | A global shared session |
-| Alembic | Ordered reviewed schema transitions | Automatic application-start migration |
+| FastAPI application | Authentication, tenant scope, validation, idempotent ingestion, current-state reads, dead-letter replay, PostgreSQL readiness | Broker publication, HTTP execution, migrations, NATS health |
+| PostgreSQL | Authoritative event/delivery/attempt/outbox state, retry due time, generation, claims, terminal reason | Remote side effects or NATS cursor state |
+| Outbox publisher | Short expiring claims, ID-only publication, PubAck-before-finalize | Ingestion, attempt/retry policy, HTTP |
+| NATS JetStream | Durable dispatch message, delayed wake-up, shared consumer ACK state | Event bodies, URLs, secrets, retry budget, terminal domain state |
+| Delivery worker | Durable pull, authoritative reconciliation, attempt lease/recovery, signing, classification, ACK/NAK/TERM decision | Full production SSRF/rate/circuit controls |
+| Test receiver | Configurable local response and bounded exact-byte capture | Durable audit, signature enforcement, customer behavior |
+| SQLAlchemy async engine | One connection pool per database-using process | A shared global session |
+| Alembic | Ordered reviewed schema transitions and data backfill | Automatic process-start migration |
 
-Every database operation uses a short `AsyncSession`. The publisher closes its
-claim transaction before broker I/O. The worker closes its attempt transaction
-before HTTP and opens a second short transaction for finalization.
+Database operations use short `AsyncSession` units. No transaction spans NATS
+or HTTP I/O. Outbox and delivery claims commit before their external operation;
+later conditional updates prove ownership.
 
 ## Public and local HTTP surfaces
 
-Mutation routes require `Content-Type: application/json`. Domain failures use
-stable `application/problem+json` responses. Tenant identity always comes from
-a verified API key; a caller never supplies the tenant ID.
+Tenant identity always comes from a verified API key. Mutation routes with JSON
+bodies require `Content-Type: application/json`; stable failures use sanitized
+`application/problem+json`.
 
 | Route | Scope | Meaning of success |
 | --- | --- | --- |
-| `GET /health/live` | public API | Process/event loop can respond; no dependency call |
-| `GET /health/ready` | public API | A bounded real PostgreSQL `SELECT 1` succeeds |
-| `POST /v1/bootstrap/tenants` | deployment bootstrap bearer | Tenant and one-time initial API key committed |
-| `GET /v1/tenant` | tenant API key | Authenticated tenant metadata |
-| `POST /v1/endpoints` | tenant API key | Endpoint and one-time signing secret committed |
-| `GET /v1/endpoints/{id}` | tenant API key | Secret-free tenant-owned endpoint metadata |
-| `POST /v1/events` | tenant key + idempotency key | Event, delivery snapshots, and outbox rows committed; delivery not implied |
-| `GET /v1/events/{id}` | tenant API key | Current event and delivery states |
+| `GET /health/live` | public | Process/event loop responds; no dependency call |
+| `GET /health/ready` | public | Bounded PostgreSQL `SELECT 1` succeeds |
+| `POST /v1/bootstrap/tenants` | deployment bootstrap bearer | Tenant and one-time initial key committed |
+| `GET /v1/tenant` | tenant key | Authenticated tenant metadata |
+| `POST /v1/endpoints` | tenant key | Endpoint and one-time signing secret committed |
+| `GET /v1/endpoints/{id}` | tenant key | Secret-free tenant-owned endpoint metadata |
+| `POST /v1/events` | tenant key + idempotency key | Event, delivery snapshots, and generation-1 outbox rows committed |
+| `GET /v1/events/{id}` | tenant key | Current status, dispatch generation, retry due time, and terminal reason |
+| `POST /v1/deliveries/{id}/replay` | tenant key | `202`; dead-lettered delivery reset to pending in a fresh generation/outbox transaction |
 
-The local test receiver exposes `/health/live`, `POST /webhooks`,
-`GET /requests`, `GET /requests/{delivery_id}`, and `DELETE /requests`. It is a
-Compose/test instrument and must not be deployed as a product endpoint.
+Replay requires JSON `expected_dispatch_generation` and includes
+`Location: /v1/events/{event_id}`. Missing/cross-tenant delivery IDs are
+indistinguishable `404`; changed generation returns
+`409 delivery_generation_conflict`; a non-dead-lettered delivery returns
+`409 delivery_not_replayable`.
 
-## Durable ingestion and idempotency boundary
+The local receiver exposes `/health/live`, `POST /webhooks`, `GET /requests`,
+`GET /requests/{delivery_id}`, and `DELETE /requests`. It is not a product
+service and loses its bounded in-memory evidence on restart.
 
-Stage 2 behavior remains unchanged:
+## Durable ingestion and idempotency
+
+Stage 2's boundary remains:
 
 1. API-key authentication derives tenant context.
 2. A versioned canonical fingerprint covers event type, payload, and endpoint
    set.
-3. Uniqueness on `(tenant_id, idempotency_key)` plus PostgreSQL
+3. `(tenant_id, idempotency_key)` uniqueness plus PostgreSQL
    `ON CONFLICT DO NOTHING RETURNING` closes concurrent races.
-4. A matching retry returns the original `201` representation and
-   `Idempotency-Replayed: true`; changed input returns `409`.
-5. One transaction creates one event, one pending delivery per endpoint, and
-   one unpublished outbox row per delivery.
-6. Each delivery snapshots its target URL and exact signing-secret row/version.
+4. Matching retry returns the original `201` creation representation and
+   replay header; changed input returns `409`.
+5. One transaction creates the immutable event, one pending delivery per
+   endpoint, and one generation-1 outbox row per delivery.
+6. Each delivery snapshots its target URL and exact signing-secret version.
 
-`201` means the acceptance transaction committed. The create response reports
-the original pending representation; `GET /v1/events/{id}` is the current-state
-view that can later report `delivering` or `succeeded`.
+`201` proves only that PostgreSQL committed acceptance and dispatch intent. The
+creation representation remains the original pending view; authenticated event
+GET returns later `delivering`, `retry_scheduled`, `succeeded`, or
+`dead_lettered` state.
 
-## Transactional outbox publication
+## Transactional outbox and dispatch generations
 
-### Message contract
+### Envelope compatibility
 
-The version-1 `delivery.requested` message contains only:
+The internal command remains strict and ID-only. Version 1 contains:
 
 ```text
 type, schema_version, message_id, tenant_id,
 event_id, endpoint_id, delivery_id
 ```
 
-`message_id` equals the outbox UUID and becomes `Nats-Msg-Id`. Event payload,
-URL, and signing secret remain in PostgreSQL.
+Stage 4 does not add a broker field or version. Positive
+`dispatch_generation` lives on delivery, attempt, and outbox database rows. The
+worker first reconciles the seven message IDs/fields with the exact outbox row,
+then derives that row's generation. Event payload, target URL, secret, and
+generation remain outside NATS.
 
-### Claim transaction
+`message_id` equals the fresh outbox UUID and becomes `Nats-Msg-Id`. Outbox
+uniqueness is `(delivery_id, topic, dispatch_generation)`: initial ingestion
+creates generation 1, and each manual replay creates another row/UUID.
 
-Migration `20260803_0002` adds nullable `claim_token` and `claim_expires_at`
-columns. Constraints require both-or-neither, require expiry after row creation,
-and prevent a published row from remaining claimed. A partial index supports
-unpublished eligibility scans.
+Keeping strict schema v1 prevents an old Stage 3 worker from TERMing a replay
+message for an unknown field/version. This is only payload compatibility.
+Manual replay should wait for Stage 4 worker cutover because an old worker can
+parse the envelope but lacks generation fencing and may send a stale request.
 
-The publisher:
+### Publication
 
-1. selects unpublished, unclaimed/expired rows ordered by creation time and ID;
-2. applies a bounded limit and `FOR UPDATE SKIP LOCKED`;
-3. validates topic/schema/payload identity;
-4. assigns one random token and database-time expiry;
-5. commits before NATS I/O;
-6. publishes sequentially and waits for the expected stream PubAck;
-7. conditionally sets `published_at` and clears the claim using row ID + token;
-8. releases still-owned current/remaining claims after a handled failure.
+The publisher still:
 
-The settings model requires claim TTL to be strictly greater than
-`batch_size * per_publish_timeout`, covering the maximum aggregate configured
-NATS publish-wait budget. Per-item PostgreSQL finalization and loop overhead are
-additional, so operators should retain margin rather than treating the formula
-as a total batch-runtime bound. During cooperative shutdown, the publisher
-checks its stop event between items and releases the unprocessed remainder.
+1. scans eligible unpublished rows in stable order;
+2. claims a bounded `FOR UPDATE SKIP LOCKED` batch with token/expiry;
+3. validates the row/envelope schema and IDs while retaining generation on the
+   PostgreSQL row;
+4. commits before NATS I/O;
+5. publishes sequentially and waits for the expected stream PubAck;
+6. conditionally sets `published_at` using row ID and claim token;
+7. releases still-owned claims after a handled failure or cooperative stop.
 
-A hard crash leaves the lease to expire. A broker success followed by lost
-PubAck, or a crash before PostgreSQL finalization, can republish. That is an
-intentional at-least-once boundary.
+Claim TTL must exceed `batch_size * publish_timeout`, the aggregate configured
+broker-wait budget. PubAck/finalization ambiguity still allows duplicate
+publication. Finite-window `Nats-Msg-Id` deduplication reduces but cannot remove
+it.
 
-## JetStream topology
+## JetStream topology and broker roles
 
-Local Compose runs `nats:2.14.3-alpine3.22` with JetStream enabled, storage at
-`/data`, and a named `nats_data` volume. Client and monitoring ports bind to
-host loopback.
+Local Compose runs `nats:2.14.3-alpine3.22` with one named file volume.
 
 ### Stream
 
@@ -166,190 +175,292 @@ host loopback.
 | --- | --- |
 | Name | `HOOKRELAY_DELIVERIES_V1` |
 | Subject | `hookrelay.delivery.requested.v1` |
-| Retention | work queue |
-| Storage | file |
-| Discard policy | reject new messages when limits are reached |
-| Maximum consumers | one overlapping consumer |
+| Retention/storage | Work queue / file |
+| Full behavior | Reject new messages (`DiscardNew`) |
 | Maximum message bytes | 16,384 |
-| Default stream byte limit | 1 GiB |
+| Default byte limit | 1 GiB |
 | Duplicate window | 600 seconds |
-| Replicas | one |
+| Replicas | One |
 
 ### Consumer
 
 | Setting | Current value |
 | --- | --- |
 | Durable name | `HOOKRELAY_DELIVERY_WORKERS_V1` |
-| Delivery | pull, deliver all, instant replay |
-| Acknowledgment | explicit |
+| Delivery | Pull, deliver-all, instant replay |
+| Acknowledgment | Explicit |
 | Default `AckWait` | 30 seconds |
-| `MaxDeliver` | unlimited (`-1`) |
+| `MaxDeliver` | Unlimited (`-1`) |
 | Default `MaxAckPending` | 32 |
-| Filter | exact delivery-requested subject |
+| Filter | Exact delivery-requested subject |
 
-Every publisher/worker connection idempotently creates absent assets and
-validates important existing settings. Incompatible drift fails startup rather
-than silently mutating a durable contract.
+`MaxDeliver=-1` is deliberate. Broker deliveries include due-time deferrals,
+active-lease deferrals, and lost ACKs. PostgreSQL counts outbound or ambiguous
+attempts and owns the maximum. The broker supplies durable transport and delayed
+wake-ups, not the business retry ledger.
 
-One file-backed local replica survives ordinary process/container recreation
-when the named volume remains. It is not a quorum, failover, backup, or HA
-design.
+Every publisher/worker idempotently creates absent assets and rejects important
+topology drift. One server/replica/volume provides local persistence, not
+quorum, failover, backup, or HA.
 
-## Worker execution and concurrency
+## Worker state machine and attempt ownership
 
-The worker binds to the existing shared durable pull consumer. It fetches no
-more than its local concurrency, waits for the batch to finish, and then fetches
-again. An `asyncio.Semaphore` repeats the hard limit inside execution. The
-long-lived async HTTP client's connection and keep-alive limits match worker
-concurrency; consumer `MaxAckPending` must be at least that limit.
+For each broker message, the worker locks the tenant-owned delivery and
+reconciles the complete envelope with the outbox and domain rows.
 
-For each strict message:
+### Generation and terminal gates
 
-1. Lock the tenant-owned delivery.
-2. Reconcile the entire broker message with the persisted outbox and delivery.
-3. If the delivery already succeeded, skip HTTP and ACK.
-4. If it is delivering with an unfinished attempt, send broker progress and do
-   not start a concurrent HTTP call.
-5. Require pending state, load the event and snapshotted secret, and enforce the
-   local/test outbound policy.
-6. Decrypt the exact secret using tenant/endpoint/row/version AES-GCM AAD.
-7. Insert the next attempt and set delivery `delivering`; commit.
-8. Send timeout-bounded HTTP without a database lock/session.
-9. Lock again and finish the owned attempt. A 2xx sets attempt and delivery
-   `succeeded`; failure records `transient_failure` and returns delivery to
-   `pending`.
-10. Call `ack_sync` only after a success commit.
+- Message generation below the delivery is stale: skip HTTP and ACK.
+- Message generation ahead of PostgreSQL is poison: TERM.
+- `succeeded` skips HTTP and ACKs.
+- `dead_lettered` skips HTTP and ACKs.
 
-Malformed messages and messages whose identities contradict authoritative
-PostgreSQL state are poison and are terminated. A destination blocked by the
-temporary outbound policy is different: it remains unacknowledged and
-recoverable, because a later reviewed policy/configuration may allow it.
+### Due-time gate
+
+For `retry_scheduled`, PostgreSQL `clock_timestamp()` is compared with
+`next_attempt_at`.
+An early message creates no attempt and receives a delayed NAK for the remaining
+time. Due work proceeds only if current-generation attempts remain below the
+configured maximum.
+
+### Attempt lease
+
+One short transaction creates an attempt with lifetime number, current
+generation, and random claim token; copies the token to the delivery; sets
+database-time expiry; changes state to `delivering`; and commits. A partial
+unique index allows one unfinished attempt per delivery.
+
+Default delivery claim TTL is 20 seconds and must exceed the ten-second HTTP
+timeout plus the explicit five-second finalization margin. Claim and due checks
+use PostgreSQL `clock_timestamp()` so wall time is not frozen at transaction
+start. An unexpired claim causes a delayed NAK for its remaining lease rather
+than another HTTP request. Attempt duration is `BIGINT` so long-stale recovery
+cannot overflow 32-bit milliseconds.
+
+After expiry, recovery marks the unfinished row `abandoned` with
+`worker_lease_expired`, counts it against the current-generation budget, clears
+the claim, and schedules or dead-letters. A finalizer must match attempt,
+generation, token, delivering state, and unexpired lease. A late worker is
+fenced with no stale-handle broker disposition.
+
+## Retry, classification, and terminal policy
+
+### Classification
+
+| Observation | Outcome |
+| --- | --- |
+| `2xx` | Success |
+| `408`, `425`, `429`, `5xx` | Transient failure |
+| Request timeout or async HTTP transport error | Transient failure |
+| Other HTTP status | Permanent failure |
+| Pre-Stage-5 target policy rejection | Terminal `target_blocked`, without HTTP attempt |
+
+Stage 4 does not follow redirects or honor `Retry-After`.
+
+### Backoff
+
+For current-generation attempt `n`:
+
+```text
+ceiling    = min(retry_max, retry_base * 2^(n - 1))
+multiplier = (1 - jitter_ratio) + jitter_ratio * U  # U uniform [0, 1]
+delay      = max(0.1, ceiling * multiplier)
+```
+
+Defaults are base 1 second, cap 60 seconds, ratio 0.25, and maximum five
+attempts per dispatch generation. The resulting due time and failed attempt
+commit together before delayed NAK. A generation-specific count drives policy;
+lifetime attempt number never resets.
+
+### Terminal state
+
+Permanent response dead-letters immediately. Transient/abandoned work
+dead-letters when attempts are exhausted. A blocked target dead-letters as
+`target_blocked` before any HTTP attempt. Terminal state requires
+`dead_lettered_at` and one of:
+
+```text
+permanent_failure | attempts_exhausted | target_blocked
+```
+
+The broker message is ACKed after the terminal transaction commits. A separate
+dead-letter stream does not exist.
+
+## Broker disposition matrix
+
+| Executor/boundary | Disposition |
+| --- | --- |
+| `succeeded`, `already_succeeded` | Synchronous ACK |
+| `dead_lettered` | Synchronous ACK after terminal commit |
+| Old-generation `stale` | Synchronous ACK |
+| `retry_scheduled` | Delayed NAK using policy delay |
+| Active-lease `in_progress` | Delayed NAK using remaining lease |
+| Target-blocked persisted by executor | Terminal ACK |
+| Target-block exception before persistence | Fixed delayed-NAK fallback |
+| Malformed/contradictory internal message | TERM |
+| Lost claim / stale finalizer | No stale-handle disposition |
+| Unexpected interruption | No disposition; broker recovery remains available |
+
+This ordering chooses duplicate observation over ACK-before-state silent loss.
 
 ## Versioned webhook wire contract
 
-The exact compact, sorted-key UTF-8 body contains:
-
-```json
-{
-  "created_at": "<original event UTC timestamp with microseconds>",
-  "delivery_id": "<delivery UUID>",
-  "id": "<stable event UUID>",
-  "payload": {},
-  "schema_version": 1,
-  "type": "<event type>"
-}
-```
-
-The worker sends the compact representation without formatting whitespace. It
-computes:
+Stage 4 preserves webhook contract version 1. The compact sorted-key UTF-8 body
+contains original event time, stable event ID, delivery ID, payload, schema
+version, and type. The HMAC remains:
 
 ```text
 v1=hex(HMAC-SHA256(secret, ASCII(unix_seconds) + b"." + exact_body_bytes))
 ```
 
-Headers are `Content-Type`, `User-Agent`, `HookRelay-Delivery-Id`,
-`HookRelay-Event-Id`, `HookRelay-Signature`, `HookRelay-Timestamp`, and
-`HookRelay-Webhook-Version`.
+Headers remain content type, service `User-Agent`, delivery ID, stable event
+ID, signature, timestamp, and webhook version. `User-Agent` now reports
+`HookRelay/0.4.0`; it is not part of the signed content.
 
-HMAC authenticates integrity and shared-secret possession; it does not encrypt
-the payload. A real receiver must verify the captured raw bytes, use a bounded
-timestamp-freshness window, compare signatures in constant time, and atomically
-deduplicate the stable event ID with its side effect.
+HMAC authenticates exact bytes and possession of the snapshotted secret. It
+does not encrypt payloads, prove freshness alone, or deduplicate receiver side
+effects. A receiver must verify raw bytes with constant-time comparison, apply
+a timestamp window, and atomically deduplicate the stable event ID.
 
-## HTTP and outbound safety boundary
+## Manual dead-letter replay
 
-One async client lives for the worker process. It uses explicit
-connect/read/write/pool deadlines plus an outer wall-clock timeout, follows no
-redirects, ignores environment proxy variables, limits connections, and streams
-the response.
+`POST /v1/deliveries/{id}/replay` locks the delivery within authenticated tenant
+scope. Only `dead_lettered` is eligible. In one transaction it:
 
-Stage 3 delivery execution is restricted to `local` and `test`. The normalized
-URL hostname must be in `HOOKRELAY_DELIVERY_ALLOWED_HOSTS`; defaults are
-`receiver`, `127.0.0.1`, and `localhost`.
+1. increments `dispatch_generation`;
+2. sets `pending` and clears schedule/terminal/claim fields;
+3. creates a new schema-v1 outbox row/UUID whose row stores the new generation;
+4. commits before returning `202` and the event `Location`.
 
-This gate is deliberately incomplete. It does not resolve/classify IPs, detect
-DNS rebinding, protect all IPv6/special-use ranges, or enforce network egress.
-Stage 5 owns complete SSRF and traffic-control design. A wildcard allowlist is
-rejected and is not an acceptable workaround.
+The fresh UUID avoids reusing an ACKed message and JetStream's duplicate window.
+Old-generation messages are ACKed as stale. Lifetime attempts and old outbox
+rows remain intact; the new generation receives a fresh bounded budget.
+
+Replay is not idempotency-keyed. Its required observed-generation precondition
+and row lock ensure one ambiguous operator intent advances at most once. A
+duplicate/stale body returns `409 delivery_generation_conflict`; current event
+detail exposes generation, due time, and terminal reason for reconciliation.
+`202` is dispatch acceptance, not delivery success.
+
+## Outbound safety boundary
+
+Workers still run only in `local` and `test`. Normalized hostnames must be in
+`HOOKRELAY_DELIVERY_ALLOWED_HOSTS`; redirects and environment proxies remain
+disabled.
+
+The executor persists a blocked target as `dead_lettered` with reason
+`target_blocked`, then the worker ACKs. This avoids an infinite policy retry
+loop while preserving operator recovery through replay after a reviewed
+allowlist change. A fixed delayed NAK remains only a fallback if policy rejection
+escapes before a terminal decision can commit.
+
+This is not complete SSRF defense. It does not resolve/classify addresses,
+handle DNS rebinding, cover special IPv4/IPv6 ranges, or enforce egress. Stage 5
+must replace the temporary boundary before production execution is enabled.
+
+## Database constraints and migration behavior
+
+Migration `20260804_0003` adds:
+
+- positive delivery, attempt, and outbox dispatch generations;
+- delivery retry time, terminal timestamp/reason, claim token/expiry;
+- attempt generation and claim token;
+- `BIGINT` attempt duration for safe long-stale recovery;
+- exact state/schedule/terminal/claim consistency constraints;
+- one unfinished attempt per delivery;
+- partial due-time index;
+- per-generation outbox uniqueness.
+
+Upgrade preserves Stage 3 evidence: unfinished attempts become `abandoned` with
+`stage4_migration_recovery`, old `delivering` rows become immediately
+`retry_scheduled`, and existing rows are generation 1. Downgrade proceeds only
+when every row remains representable in Stage 3: no delivery may be
+`delivering`, `retry_scheduled`, or `dead_lettered`; every delivery, attempt, and
+outbox generation must be 1; and attempt duration must fit the former 32-bit
+integer. It refuses instead of silently mapping or truncating Stage 4 evidence.
 
 ## State and acknowledgment invariants
 
-1. Event `201` occurs after event/delivery/outbox commit.
-2. Outbox claims are short and expire; no database lock spans NATS I/O.
-3. `published_at` occurs only after expected-stream PubAck.
-4. Broker payloads never carry event bodies, URLs, or secrets.
-5. Worker execution never trusts broker identities without PostgreSQL checks.
-6. Only local/test and explicitly allowlisted hostnames can execute in Stage 3.
-7. An attempt and `delivering` state commit before HTTP.
-8. No database transaction spans HTTP.
-9. Exact signed bytes equal exact sent bytes.
-10. A 2xx attempt and delivery success commit together.
-11. Broker ACK occurs only after that commit.
-12. A succeeded delivery suppresses duplicate HTTP on broker redelivery.
-13. Failed or policy-blocked work remains unacknowledged/recoverable; malformed
-    or state-contradictory poison messages terminate.
-14. No implementation or documentation claims exactly once.
+1. Event `201` follows event/delivery/outbox commit.
+2. Outbox `published_at` follows expected-stream PubAck.
+3. Broker envelopes remain ID-only and are reconciled with PostgreSQL.
+4. The schema-v1 broker payload remains unchanged; generation comes from the
+   exact reconciled outbox row.
+5. One unfinished attempt and matching delivery claim may exist.
+6. Attempt/claim commits before HTTP; no database transaction spans HTTP.
+7. PostgreSQL `clock_timestamp()` owns claim expiry and retry due time.
+8. Only due current-generation work can create a new attempt.
+9. Retry failure and due time commit together before delayed NAK.
+10. Permanent/exhausted/blocked terminal state commits before ACK.
+11. Success attempt and delivery commit together before ACK.
+12. A stale finalizer cannot mutate a recovered owner.
+13. An old-generation message cannot execute a replay generation.
+14. Replay generation/state/fresh outbox commit atomically before `202`.
+15. Attempts/history remain; replay resets only generation-scoped budget.
+16. No documentation or implementation claims exactly once.
 
 ## Failure boundaries
 
 | Window | Result |
 | --- | --- |
-| API commit before publisher sees row | Durable outbox remains discoverable |
-| Publisher claim before crash | Lease eventually expires |
-| NATS stores message before PubAck/finalization is known | Possible duplicate publication |
-| Attempt commit before worker crash | Unfinished `delivering` row can remain stuck in Stage 3 |
-| Receiver side effect before HookRelay success commit | Possible duplicate HTTP request |
-| Success commit before broker ACK is known | Redelivery skips HTTP using succeeded database state |
-| Timeout/transport/non-2xx | Transient attempt recorded, delivery pending, message unacknowledged |
-
-Stage 4 must add persistent scheduling, backoff/jitter, maximum attempts,
-classification, explicit redelivery policy, stale-attempt recovery, dead-letter
-state, replay, and kill/restart evidence. Current `AckWait` redelivery is not a
-finished retry system.
+| API commit before publisher | Durable outbox remains discoverable |
+| PubAck before outbox finalization | Possible duplicate publication |
+| Attempt commit before worker death | Lease eventually abandons and schedules/terminates |
+| Receiver acts before HookRelay finalization | Possible duplicate HTTP on recovery |
+| Retry commit before NAK | Lost NAK leads to `AckWait`; DB still enforces due time |
+| Success/dead-letter commit before ACK | Redelivery observes terminal state and ACKs without HTTP |
+| Lease expiry before old worker finalizes | Old finalizer is fenced; remote side effect remains ambiguous |
+| Replay commit before publisher | Fresh outbox intent survives broker outage |
+| Old message after replay | Lower generation ACKs stale without HTTP |
+| NATS volume loss | Published unacked transport may be lost; local topology is not DR |
 
 ## Health, lifecycle, and deployment
 
 - API liveness has no dependency call.
-- API readiness probes only PostgreSQL because the API's contract is durable
-  acceptance, not synchronous delivery.
-- Compose health gates startup ordering but does not continuously supervise
-  dependencies.
-- API, publisher, and worker each dispose their database engine.
-- Publisher and worker drain NATS connections during cooperative shutdown with
-  a bounded default drain timeout of five seconds.
+- API readiness probes only PostgreSQL because API contract is durable
+  acceptance/replay, not synchronous background completion.
+- Compose health gates initial order, not continuous supervision.
+- API, publisher, and worker dispose database engines.
+- Publisher/worker drain NATS with a bounded default five-second timeout.
 - Worker closes its long-lived HTTP client.
-- Compose gives the worker a 25-second stop grace period, longer than the
-  default ten-second HTTP deadline plus shutdown cleanup margin.
-- NATS/PostgreSQL named volumes survive `docker compose down`; `--volumes`
-  deletes them.
+- Worker stop grace remains longer than the HTTP/drain cleanup budget.
+- Named volumes survive `docker compose down`; `--volumes` destroys them.
 
-Environment variables are configuration delivery, not automatic secret
-management. Local credentials are examples; production needs managed secrets,
-TLS/authentication for NATS/PostgreSQL/HTTP boundaries, least privilege,
-rotation, backup, monitoring, and reviewed deployment controls.
+Environment variables deliver configuration; they are not automatic secret
+management. Production needs managed credentials, TLS, least privilege,
+rotation, backups, monitoring, and reviewed deployment controls.
 
 ## Verification boundaries
 
 | Evidence | Proves | Does not prove |
 | --- | --- | --- |
-| Pure unit vectors | Deterministic body/signature, strict envelope, desired topology, local concurrency bound | Real database, broker, HTTP, or process behavior |
-| Settings tests | Cross-setting safety constraints and local gate | Safe DNS resolution or trustworthy deployment input |
-| PostgreSQL integration | Constraints, leases, transactions, attempt/delivery state | Every crash schedule or long-running recovery |
-| Real JetStream integration | Topology, PubAck, durable pull/ACK behavior | Cluster quorum, disaster recovery, production disk behavior |
-| End-to-end happy path | API -> DB -> publisher -> NATS -> worker -> receiver interoperability | Exactly once, Stage 4 recovery, Stage 5 hostile-network safety, HA, capacity |
+| Pure policy tests | Exact jitter bounds/cap, classifier, strict schema-v1 envelope, result/disposition invariants | Real database, broker, HTTP, or process behavior |
+| Settings tests | Claim/timeout and base/cap relationships | Operational tuning or safe arbitrary destinations |
+| PostgreSQL integration | Constraints, due state, claim/fencing, generation, dead letter, replay transactions | Every crash schedule or remote side effect |
+| Real JetStream/HTTP integration | PubAck, pull, delayed/terminal disposition where exercised, signed requests | Cluster quorum, production durability, hostile networks |
+| API/tenant/concurrency tests | Replay response, isolation, state serialization, fresh outbox cardinality | Lost client response handling as an idempotent API |
+| Automated subprocess hard-kill plus manual exercise | A worker is killed after receiver capture; an expired claim is abandoned and a replacement recovers the same body for that schedule | Every crash point, receiver exactly once, HA, capacity |
 | Compose/image checks | Local topology and packaged Linux artifact | Continuous supervision or production operations |
 
-## Roadmap boundary after Stage 3
+The Stage 4 integration suite has twelve real-service recovery scenarios,
+including fresh database-clock behavior after a row-lock wait and one that
+starts and terminates a separate worker OS process. At the Stage 4 checkpoint,
+the complete suite passed all 143 tests. Fixture-driven expired leases and task
+cancellation remain different evidence; the subprocess test proves its encoded
+schedule, not arbitrary process-kill timing.
+
+## Roadmap boundary after Stage 4
 
 ```text
 Producer
-  -> API + PostgreSQL acceptance                 implemented
-  -> outbox leases + JetStream publication       implemented
-  -> bounded signed delivery + local receiver    implemented
-  -> retry/backoff/crash recovery/dead letters   Stage 4
-  -> full SSRF/rate/circuit controls              Stage 5
-  -> telemetry and operations console            Stage 6
-  -> fault/scale evidence and release             Stage 7
+  -> API + PostgreSQL acceptance                    implemented
+  -> outbox leases + JetStream publication          implemented
+  -> bounded signed delivery                        implemented
+  -> persistent retry/classification/crash recovery implemented
+  -> dead-letter state + manual replay              implemented
+  -> full SSRF/rate/circuit controls                Stage 5
+  -> telemetry/history UI                           Stage 6
+  -> fault/scale evidence and release               Stage 7
 ```
 
 ## Decision index
@@ -360,4 +471,7 @@ See [Architecture Decision Records](decisions/README.md), especially:
 - [0005: transactional outbox](decisions/0005-transactional-outbox.md)
 - [0008: NATS JetStream dispatch](decisions/0008-nats-jetstream-dispatch.md)
 - [0009: versioned webhook signature](decisions/0009-versioned-webhook-signature.md)
-- [0010: Stage 3 local outbound gate](decisions/0010-stage3-local-outbound-gate.md)
+- [0010: local outbound gate](decisions/0010-stage3-local-outbound-gate.md)
+- [0011: PostgreSQL-authoritative retry schedule](decisions/0011-postgresql-authoritative-retry-schedule.md)
+- [0012: leased attempt recovery and dead letters](decisions/0012-leased-attempt-recovery-and-dead-letters.md)
+- [0013: versioned dispatch replay](decisions/0013-versioned-dispatch-replay.md)

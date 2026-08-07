@@ -39,7 +39,7 @@ async def create_event(
     idempotency_key: Annotated[str, Depends(require_idempotency_key)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EventResponse:
-    """Commit accepted work; separate Stage 3 processes deliver it asynchronously."""
+    """Commit accepted work; separate publisher and worker processes deliver it."""
 
     try:
         result = await ingest_event(session, tenant, request, idempotency_key)

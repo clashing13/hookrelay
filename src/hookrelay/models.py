@@ -4,6 +4,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -244,7 +245,41 @@ class Delivery(CreatedAtMixin, Base):
         ),
         CheckConstraint("char_length(target_url) <= 2048", name="target_url_length"),
         CheckConstraint("btrim(target_url) <> ''", name="target_url_not_blank"),
+        CheckConstraint("dispatch_generation > 0", name="dispatch_generation_positive"),
+        CheckConstraint(
+            "((status = 'delivering' AND claim_token IS NOT NULL "
+            "AND claim_expires_at IS NOT NULL) OR "
+            "(status <> 'delivering' AND claim_token IS NULL "
+            "AND claim_expires_at IS NULL))",
+            name="claim_state_consistent",
+        ),
+        CheckConstraint(
+            "(status = 'retry_scheduled') = (next_attempt_at IS NOT NULL)",
+            name="retry_schedule_consistent",
+        ),
+        CheckConstraint(
+            "((status = 'dead_lettered' AND dead_lettered_at IS NOT NULL "
+            "AND dead_letter_reason IS NOT NULL) OR "
+            "(status <> 'dead_lettered' AND dead_lettered_at IS NULL "
+            "AND dead_letter_reason IS NULL))",
+            name="dead_letter_state_consistent",
+        ),
+        CheckConstraint(
+            "dead_letter_reason IS NULL OR "
+            "dead_letter_reason IN "
+            "('permanent_failure', 'attempts_exhausted', 'target_blocked')",
+            name="dead_letter_reason_valid",
+        ),
+        CheckConstraint(
+            "claim_expires_at IS NULL OR claim_expires_at > created_at",
+            name="claim_expiry_after_creation",
+        ),
         Index("ix_deliveries_tenant_id_status_created_at", "tenant_id", "status", "created_at"),
+        Index(
+            "ix_deliveries_retry_scheduled_next_attempt_at",
+            "next_attempt_at",
+            postgresql_where=text("status = 'retry_scheduled'"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -260,6 +295,14 @@ class Delivery(CreatedAtMixin, Base):
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="pending", server_default="pending"
     )
+    dispatch_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dead_letter_reason: Mapped[str | None] = mapped_column(String(32))
+    claim_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DeliveryAttempt(Base):
@@ -274,6 +317,7 @@ class DeliveryAttempt(Base):
             ondelete="RESTRICT",
         ),
         CheckConstraint("attempt_number > 0", name="attempt_number_positive"),
+        CheckConstraint("dispatch_generation > 0", name="dispatch_generation_positive"),
         CheckConstraint(
             "outcome IS NULL OR outcome IN ('succeeded', 'transient_failure', "
             "'permanent_failure', 'abandoned')",
@@ -293,7 +337,17 @@ class DeliveryAttempt(Base):
             "finished_at IS NULL OR finished_at >= started_at",
             name="finish_not_before_start",
         ),
+        CheckConstraint(
+            "finished_at IS NOT NULL OR claim_token IS NOT NULL",
+            name="active_attempt_has_claim",
+        ),
         Index("ix_delivery_attempts_tenant_id_started_at", "tenant_id", "started_at"),
+        Index(
+            "uq_delivery_attempts_unfinished_delivery",
+            "delivery_id",
+            unique=True,
+            postgresql_where=text("finished_at IS NULL"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -304,6 +358,10 @@ class DeliveryAttempt(Base):
     )
     delivery_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    dispatch_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    claim_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -311,7 +369,7 @@ class DeliveryAttempt(Base):
     outcome: Mapped[str | None] = mapped_column(String(32))
     response_status_code: Mapped[int | None] = mapped_column(SmallInteger)
     error_code: Mapped[str | None] = mapped_column(String(100))
-    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    duration_ms: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class OutboxMessage(CreatedAtMixin, Base):
@@ -319,7 +377,8 @@ class OutboxMessage(CreatedAtMixin, Base):
 
     __tablename__ = "outbox_messages"
     __table_args__ = (
-        UniqueConstraint("delivery_id", "topic"),
+        UniqueConstraint("delivery_id", "topic", "dispatch_generation"),
+        CheckConstraint("dispatch_generation > 0", name="dispatch_generation_positive"),
         CheckConstraint("schema_version > 0", name="schema_version_positive"),
         CheckConstraint("topic = 'delivery.requested'", name="topic_valid"),
         ForeignKeyConstraint(
@@ -362,6 +421,9 @@ class OutboxMessage(CreatedAtMixin, Base):
         nullable=False,
     )
     delivery_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    dispatch_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
     schema_version: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=1, server_default="1"
     )

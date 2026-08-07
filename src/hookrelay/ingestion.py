@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import json
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 from pydantic import JsonValue
@@ -81,26 +81,43 @@ def build_outbox_messages(
 
     messages: list[OutboxMessage] = []
     for delivery in deliveries:
-        outbox_id = uuid4()
         messages.append(
-            OutboxMessage(
-                id=outbox_id,
+            build_delivery_outbox_message(
                 tenant_id=tenant_id,
-                delivery_id=delivery.id,
-                schema_version=OUTBOX_SCHEMA_VERSION,
-                topic=OUTBOX_TOPIC,
-                payload={
-                    "delivery_id": str(delivery.id),
-                    "endpoint_id": str(delivery.endpoint_id),
-                    "event_id": str(event_id),
-                    "message_id": str(outbox_id),
-                    "schema_version": OUTBOX_SCHEMA_VERSION,
-                    "tenant_id": str(tenant_id),
-                    "type": OUTBOX_TOPIC,
-                },
+                event_id=event_id,
+                delivery=delivery,
             )
         )
     return messages
+
+
+def build_delivery_outbox_message(
+    *,
+    tenant_id: UUID,
+    event_id: UUID,
+    delivery: Delivery,
+) -> OutboxMessage:
+    """Create one fresh dispatch identity for initial delivery or manual replay."""
+
+    outbox_id = uuid4()
+    dispatch_generation = delivery.dispatch_generation or 1
+    return OutboxMessage(
+        id=outbox_id,
+        tenant_id=tenant_id,
+        delivery_id=delivery.id,
+        dispatch_generation=dispatch_generation,
+        schema_version=OUTBOX_SCHEMA_VERSION,
+        topic=OUTBOX_TOPIC,
+        payload={
+            "delivery_id": str(delivery.id),
+            "endpoint_id": str(delivery.endpoint_id),
+            "event_id": str(event_id),
+            "message_id": str(outbox_id),
+            "schema_version": OUTBOX_SCHEMA_VERSION,
+            "tenant_id": str(tenant_id),
+            "type": OUTBOX_TOPIC,
+        },
+    )
 
 
 def _idempotency_conflict() -> ApiProblem:
@@ -230,6 +247,12 @@ async def event_detail_response(session: AsyncSession, event: Event) -> EventDet
                 id=delivery.id,
                 endpoint_id=delivery.endpoint_id,
                 status=cast(DeliveryStatus, delivery.status),
+                dispatch_generation=delivery.dispatch_generation,
+                next_attempt_at=delivery.next_attempt_at,
+                dead_letter_reason=cast(
+                    "Literal['permanent_failure', 'attempts_exhausted', 'target_blocked'] | None",
+                    delivery.dead_letter_reason,
+                ),
             )
             for delivery in deliveries
         ],
@@ -300,6 +323,7 @@ async def ingest_event(
             signing_secret_id=snapshot.signing_secret_id,
             target_url=snapshot.target_url,
             status="pending",
+            dispatch_generation=1,
         )
         for snapshot in snapshots
     ]

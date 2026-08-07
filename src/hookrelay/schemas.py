@@ -105,6 +105,31 @@ class DeliveryDetailResponse(StrictModel):
     id: UUID
     endpoint_id: UUID
     status: DeliveryStatus
+    dispatch_generation: int = Field(default=1, ge=1)
+    next_attempt_at: datetime | None = None
+    dead_letter_reason: (
+        Literal[
+            "permanent_failure",
+            "attempts_exhausted",
+            "target_blocked",
+        ]
+        | None
+    ) = None
+
+
+class DeliveryReplayRequest(StrictModel):
+    """Optimistic precondition that prevents one operator action replaying twice."""
+
+    expected_dispatch_generation: int = Field(ge=1)
+
+
+class DeliveryReplayResponse(StrictModel):
+    """Accepted asynchronous retry cycle for one dead-lettered delivery."""
+
+    id: UUID
+    event_id: UUID
+    status: Literal["pending"]
+    dispatch_generation: int = Field(ge=2)
 
 
 class EventCreate(StrictModel):

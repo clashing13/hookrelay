@@ -1,8 +1,8 @@
 # HookRelay
 
 HookRelay is a fault-tolerant webhook-delivery platform built as a seven-stage
-distributed-systems learning project. Version `0.3.0` implements the first
-complete local happy path:
+distributed-systems learning project. Version `0.4.0` implements durable event
+acceptance, signed delivery, and bounded failure recovery:
 
 ```text
 Producer
@@ -11,91 +11,120 @@ Producer
   -> outbox publisher
   -> NATS JetStream
   -> bounded delivery worker
-  -> HMAC-signed HTTP request
-  -> configurable local test receiver
+       -> success
+       -> persistent retry schedule + delayed NAK
+       -> expired worker-claim recovery
+       -> dead-lettered terminal state
+  -> authenticated manual replay as a fresh dispatch generation
 ```
 
-Start with the [Stage 3 delivery-pipeline guide](docs/stages/03-delivery-pipeline.md)
-for the full event trace, exact wire contract, failure exercises, tests, and
-teach-back checklist. The [Stage 2](docs/stages/02-event-ingestion.md) and
-[Stage 1](docs/stages/01-foundation.md) guides remain the detailed foundation.
+Start with the [Stage 4 failure-recovery guide](docs/stages/04-failure-recovery.md)
+for the complete state machine, exact backoff formula, crash exercise, tests,
+and teach-back checklist. The [Stage 3](docs/stages/03-delivery-pipeline.md),
+[Stage 2](docs/stages/02-event-ingestion.md), and
+[Stage 1](docs/stages/01-foundation.md) guides preserve the earlier boundaries.
 
-## Stage 3 capabilities
+## Stage 4 capabilities
 
 - authenticated, tenant-scoped, idempotent event ingestion;
-- one PostgreSQL transaction for an event, delivery snapshots, and one
-  versioned outbox row per destination;
-- expiring PostgreSQL claim leases so publishers do not hold row locks during
-  broker I/O;
-- NATS 2.14.3 with a file-backed work-queue stream,
-  `HOOKRELAY_DELIVERIES_V1`, on `hookrelay.delivery.requested.v1`;
-- a shared durable pull consumer, `HOOKRELAY_DELIVERY_WORKERS_V1`;
-- ID-only broker payloads and `Nats-Msg-Id` set to the outbox UUID;
-- bounded async worker concurrency and matching HTTP connection limits;
-- attempt-before-HTTP state and success-commit-before-ACK ordering;
-- deterministic version-1 JSON signed with HMAC-SHA256 over
-  `timestamp + "." + exact_body_bytes`;
-- explicit HTTP timeout, no redirects, and no environment proxy inheritance;
-- a configurable local receiver that retains bounded exact body/header evidence;
-- a real PostgreSQL/JetStream/HTTP happy-path test.
+- one PostgreSQL transaction for an event, delivery snapshots, and one fresh
+  versioned outbox row per destination/generation;
+- expiring outbox publisher claims and PubAck-before-`published_at` ordering;
+- NATS JetStream file-backed work queue and shared durable pull consumer;
+- bounded async worker/HTTP concurrency;
+- exact-byte timestamped HMAC-SHA256 webhook signing;
+- PostgreSQL-authoritative `retry_scheduled` state and `next_attempt_at`;
+- capped exponential backoff with configurable bounded downward jitter;
+- explicit success, transient, and permanent HTTP failure classification;
+- maximum attempts per dispatch generation;
+- delivery/attempt claim leases, abandonment, and stale-finalizer fencing;
+- terminal dead-letter timestamp/reason before broker ACK;
+- authenticated `202` manual replay with a new generation and outbox UUID;
+- unchanged strict schema-v1 ID-only broker envelopes, with dispatch generation
+  derived from the reconciled PostgreSQL outbox row;
+- a configurable local receiver retaining bounded exact-byte/header evidence.
 
-The default 60-second claim TTL must remain greater than the aggregate broker
-publish-timeout budget (`25` rows x `2` seconds each), with margin for database
-finalization and loop overhead. Cooperative publisher shutdown releases the
-unprocessed claim remainder, and NATS drain is bounded to five seconds.
+Default recovery policy:
 
-The API, outbox publisher, worker, and receiver are separate processes. The API
-can continue durable PostgreSQL acceptance while NATS is temporarily
-unavailable; background backlog is observable in `outbox_messages`.
+| Setting | Default |
+| --- | --- |
+| HTTP timeout | 10 seconds |
+| Delivery claim TTL | 20 seconds |
+| Finalization margin | 5 seconds |
+| Attempts per dispatch generation | 5 |
+| Retry base/cap | 1 / 60 seconds |
+| Downward jitter ratio | 0.25 |
+| Policy-block handling | terminal `target_blocked`; 30-second delayed-NAK fallback |
+
+For generation attempt `n`, HookRelay caps `base * 2^(n-1)` at the configured
+maximum, then samples uniformly from 75%-100% of that ceiling with the default
+jitter. The exact database due time is authoritative; delayed NAK is only the
+broker wake-up mechanism.
 
 ## Current guarantee and limits
 
-HookRelay is **at least once**, never general-purpose exactly once. JetStream
-may store a publication whose PubAck is lost, or a receiver may commit a side
-effect before HookRelay loses the HTTP response or its own success update.
-Stable event IDs and receiver-side idempotency are required.
+HookRelay is **at least once**, never general-purpose exactly once. A receiver
+may commit its side effect before HookRelay loses the response or a worker is
+killed. Claim fencing prevents stale database finalization, not a remote side
+effect. Receivers must atomically deduplicate the stable event ID with their
+business change.
 
-Stage 3 is intentionally a local/test delivery boundary:
+JetStream `MaxDeliver` remains unlimited because broker delivery count is not
+HTTP attempt count. PostgreSQL counts actual and ambiguous abandoned attempts
+within the current dispatch generation. Permanent failures dead-letter
+immediately; transient failures dead-letter after the configured maximum.
+Manual replay increments the generation and creates a fresh outbox UUID while
+preserving lifetime attempt history.
 
-- workers refuse to run in staging or production;
-- target hostnames must be explicitly allowlisted;
-- redirects and environment proxies are disabled;
-- complete DNS/IP/rebinding/egress SSRF protection arrives in Stage 5.
+Broker schema v1 remains unchanged for payload compatibility. Manual replay
+should wait until Stage 4 worker cutover completes: an old Stage 3 worker can
+parse the message but lacks generation fencing and may send an extra stale
+request.
 
-Stage 4 owns designed retry scheduling, exponential backoff, jitter, maximum
-attempts, classification, stale-attempt/worker-crash recovery, dead letters,
-and replay. Today, a timeout, transport error, or non-2xx result is recorded as
-a transient failure and left unacknowledged for JetStream `AckWait` redelivery.
-That behavior is not a finished retry policy. Policy-blocked destinations also
-remain unacknowledged/recoverable; only malformed or authoritative-state-
-mismatched poison messages are terminated.
+Outbound execution is still restricted to controlled `local`/`test` targets.
+Workers use an explicit hostname allowlist, disable redirects, and ignore
+environment proxies. A blocked target is persisted as dead-lettered with reason
+`target_blocked` and ACKed; replay can recover it after a reviewed configuration
+change. This is not complete SSRF protection. Stage 5 owns DNS/IP/rebinding and
+egress defenses, rate limiting, circuit breaking, size policy, and secret
+rotation.
 
-Local Compose uses one file-backed NATS replica and named volume. It does not
-claim high availability, disaster recovery, production security, or benchmark
-scale.
+Stage 6 owns full history/attempt APIs, observability, dashboards, and the
+operations UI. Stage 7 owns fault/load evidence, capacity measurements, and
+release claims. Local Compose has one NATS server/replica and named volume; it
+is reproducible persistence, not HA, backup, or disaster recovery.
 
 ## HTTP contract
 
 | Method and route | Authentication | Success contract |
 | --- | --- | --- |
-| `GET /health/live` | none | `200`; process-local health |
-| `GET /health/ready` | none | `200` after a bounded PostgreSQL probe |
-| `POST /v1/bootstrap/tenants` | bootstrap bearer token | `201`; tenant and raw initial API key returned once |
-| `GET /v1/tenant` | tenant API key | `200`; authenticated tenant only |
-| `POST /v1/endpoints` | tenant API key | `201`; endpoint and raw signing secret returned once |
-| `GET /v1/endpoints/{endpoint_id}` | tenant API key | `200`; secret-free tenant-owned metadata |
-| `POST /v1/events` | tenant API key plus `Idempotency-Key` | `201`; durable event and initial pending deliveries |
-| `GET /v1/events/{event_id}` | tenant API key | `200`; event and current delivery states |
+| `GET /health/live` | none | `200`; dependency-free process health |
+| `GET /health/ready` | none | `200`; bounded PostgreSQL probe succeeds |
+| `POST /v1/bootstrap/tenants` | bootstrap bearer token | `201`; tenant and one-time initial API key |
+| `GET /v1/tenant` | tenant API key | `200`; authenticated tenant metadata |
+| `POST /v1/endpoints` | tenant API key | `201`; endpoint and one-time signing secret |
+| `GET /v1/endpoints/{endpoint_id}` | tenant API key | `200`; secret-free tenant metadata |
+| `POST /v1/events` | tenant key + `Idempotency-Key` | `201`; event/deliveries/outbox committed |
+| `GET /v1/events/{event_id}` | tenant API key | `200`; current state, generation, due time, and terminal reason |
+| `POST /v1/deliveries/{delivery_id}/replay` | tenant API key + JSON expected generation | `202`; dead-lettered delivery reset to a fresh pending generation |
+
+Replay requires
+`{"expected_dispatch_generation": <observed positive generation>}` and returns
+`Location: /v1/events/{event_id}`. Missing and cross-tenant IDs share opaque
+`404`; changed generation returns `409 delivery_generation_conflict`; a
+delivery not currently dead-lettered returns `409 delivery_not_replayable`.
+`202` proves PostgreSQL committed the new generation and outbox intent, not
+broker publication or receiver success.
 
 The receiver is a local inspection tool, not a product API:
 
 | Route | Purpose |
 | --- | --- |
-| `GET /health/live` | receiver process health |
-| `POST /webhooks` | configurable delivery target |
-| `GET /requests` | bounded captured-request list |
-| `GET /requests/{delivery_id}` | captures for one delivery |
-| `DELETE /requests` | clear in-memory captures |
+| `GET /health/live` | Receiver process health |
+| `POST /webhooks` | Configurable delivery target |
+| `GET /requests` | Bounded captured-request list |
+| `GET /requests/{delivery_id}` | Captures for one delivery |
+| `DELETE /requests` | Clear in-memory captures |
 
 ## Prerequisites
 
@@ -113,15 +142,14 @@ Python dependency graph.
 Windows PowerShell:
 
 ```powershell
-git clone --branch codex/stage-03-delivery-pipeline --single-branch https://github.com/clashing13/hookrelay.git
+git clone --branch codex/stage-04-failure-recovery --single-branch https://github.com/clashing13/hookrelay.git
 Set-Location hookrelay
 Copy-Item .env.example .env
 ```
 
-Before the first Compose startup, edit the ignored `.env`: choose the local
-database password, encryption key, and bootstrap token you will actually use.
-The checked-in examples are not deployable secrets. Commands below that show
-example credentials must be updated to those chosen values.
+Before starting Compose, edit ignored `.env`: replace the example database
+password, encryption key, and bootstrap token. Checked-in examples are not
+deployable secrets.
 
 ```powershell
 $env:POSTGRES_HOST_PORT = "55432"
@@ -133,7 +161,7 @@ docker compose up --detach outbox-publisher worker
 docker compose ps
 ```
 
-Check each local boundary:
+Check every local boundary:
 
 ```powershell
 curl.exe --fail http://127.0.0.1:8000/health/live
@@ -161,8 +189,7 @@ $bootstrap = Invoke-RestMethod `
 $apiKey = $bootstrap.api_key.key
 ```
 
-Create a receiver endpoint. Because the worker runs inside Compose, use the
-service name `receiver`, not host loopback:
+Create the local receiver endpoint. The worker uses Compose service-name DNS:
 
 ```powershell
 $authHeaders = @{ Authorization = "Bearer $apiKey" }
@@ -176,10 +203,9 @@ $endpoint = Invoke-RestMethod `
   -Headers $authHeaders `
   -ContentType "application/json" `
   -Body $endpointBody
-$signingSecret = $endpoint.signing_secret
 ```
 
-Submit an event and poll the receiver/current-state route:
+Submit an event and read asynchronous current state:
 
 ```powershell
 $eventHeaders = @{
@@ -197,22 +223,15 @@ $event = Invoke-RestMethod `
   -Headers $eventHeaders `
   -ContentType "application/json" `
   -Body $eventBody
-$deliveryId = $event.deliveries[0].id
-
-do {
-  Start-Sleep -Milliseconds 250
-  $captures = @(
-    Invoke-RestMethod "http://127.0.0.1:9000/requests/$deliveryId"
-  )
-} while ($captures.Count -eq 0)
 
 Invoke-RestMethod `
   -Uri "http://127.0.0.1:8000/v1/events/$($event.id)" `
   -Headers $authHeaders
 ```
 
-See the [Stage 3 guide](docs/stages/03-delivery-pipeline.md#verify-exact-body-bytes-and-hmac-independently)
-for independent HMAC verification and durable-state inspection.
+The Stage 4 guide contains exact demonstrations for transient recovery,
+permanent dead letter, authenticated replay, and a safe local worker kill:
+[run and test Stage 4](docs/stages/04-failure-recovery.md#10-exact-commands-for-running-and-testing).
 
 Stop containers while preserving PostgreSQL and NATS data:
 
@@ -220,7 +239,7 @@ Stop containers while preserving PostgreSQL and NATS data:
 docker compose down
 ```
 
-`docker compose down --volumes` deletes both named volumes. Use it only for an
+`docker compose down --volumes` deletes both named volumes and is only for an
 intentional fresh start.
 
 ## Host Python workflow
@@ -233,7 +252,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\uv.exe sync --frozen --all-groups
 ```
 
-Start PostgreSQL, NATS, and the receiver, then use host addresses:
+Start dependencies and use host addresses:
 
 ```powershell
 $env:POSTGRES_HOST_PORT = "55432"
@@ -245,7 +264,7 @@ $env:HOOKRELAY_DELIVERY_ALLOWED_HOSTS = '["127.0.0.1","localhost"]'
 .\.venv\Scripts\alembic.exe upgrade head
 ```
 
-Run these long-lived commands in separate terminals with the same environment:
+Run these in separate terminals with the same environment:
 
 ```powershell
 .\.venv\Scripts\hookrelay.exe
@@ -253,8 +272,7 @@ Run these long-lived commands in separate terminals with the same environment:
 .\.venv\Scripts\hookrelay-worker.exe
 ```
 
-For a host-run worker, create endpoints using
-`http://127.0.0.1:9000/webhooks`.
+For a host worker, use `http://127.0.0.1:9000/webhooks` as the endpoint.
 
 ## Checks
 
@@ -270,10 +288,54 @@ Fast checks:
 Real-service checks:
 
 ```powershell
-$env:POSTGRES_HOST_PORT = "55432"
+$postgresHostPort = "55432"
+$env:POSTGRES_HOST_PORT = $postgresHostPort
 docker compose stop api outbox-publisher worker receiver
 docker compose up --detach --wait postgres nats
-$env:HOOKRELAY_TEST_DATABASE_URL = "postgresql+asyncpg://hookrelay:change-me-for-local-development@127.0.0.1:55432/hookrelay"
+
+# Enter the values from the current untracked .env used by this PostgreSQL
+# container. The password prompt is masked.
+$postgresUser = Read-Host "POSTGRES_USER from .env"
+$securePostgresPassword = Read-Host "POSTGRES_PASSWORD from .env" -AsSecureString
+$postgresCredential = [System.Net.NetworkCredential]::new(
+  $postgresUser,
+  $securePostgresPassword
+)
+if ([string]::IsNullOrWhiteSpace($postgresCredential.UserName) -or
+    [string]::IsNullOrEmpty($postgresCredential.Password)) {
+  throw "PostgreSQL user and password are required."
+}
+
+$testDatabase = "hookrelay_test"
+$databaseExists = docker compose exec -T postgres psql `
+  --username $postgresCredential.UserName `
+  --dbname postgres `
+  --tuples-only `
+  --no-align `
+  --command "SELECT 1 FROM pg_database WHERE datname = '$testDatabase';"
+if ($LASTEXITCODE -ne 0) {
+  throw "Could not inspect the PostgreSQL databases."
+}
+if (($databaseExists -join "").Trim() -eq "1") {
+  $disposableConfirmation = Read-Host `
+    "$testDatabase already exists; type its exact name to confirm it is disposable"
+  if ($disposableConfirmation -cne $testDatabase) {
+    throw "Refusing to run integration tests against an unconfirmed database."
+  }
+} else {
+  docker compose exec -T postgres createdb `
+    --username $postgresCredential.UserName `
+    --owner $postgresCredential.UserName `
+    $testDatabase
+  if ($LASTEXITCODE -ne 0) {
+    throw "Could not create the disposable $testDatabase database."
+  }
+}
+
+$encodedPostgresUser = [Uri]::EscapeDataString($postgresCredential.UserName)
+$encodedPostgresPassword = [Uri]::EscapeDataString($postgresCredential.Password)
+$env:HOOKRELAY_TEST_DATABASE_URL = `
+  "postgresql+asyncpg://${encodedPostgresUser}:${encodedPostgresPassword}@127.0.0.1:$postgresHostPort/$testDatabase"
 $env:HOOKRELAY_DATABASE_URL = $env:HOOKRELAY_TEST_DATABASE_URL
 $env:HOOKRELAY_NATS_URL = "nats://127.0.0.1:4222"
 $env:HOOKRELAY_TEST_NATS_URL = "nats://127.0.0.1:4222"
@@ -282,25 +344,36 @@ $env:HOOKRELAY_TEST_NATS_URL = "nats://127.0.0.1:4222"
 .\.venv\Scripts\pytest.exe -m concurrency
 .\.venv\Scripts\alembic.exe check
 docker compose config --quiet
-docker build --pull --tag hookrelay:stage3 .
+docker build --pull --tag hookrelay:stage4 .
 ```
 
-Stopping the long-lived application processes prevents them from claiming rows
-created by the deterministic integration harness. Substitute the password you
-chose in `.env`, and use only a disposable local/test database.
-
-Passing every current check still does not prove exactly once, failure
-recovery, HA, hostile network safety, or production capacity.
+Stopping long-lived application processes prevents them from claiming rows
+created by deterministic integration harnesses. The commands create or reuse
+only the explicitly named `hookrelay_test`; they never point tests at the normal
+`POSTGRES_DB` or drop a database. Reserve `hookrelay_test` for disposable test
+data and stop if it contains anything valuable.
+At the Stage 4 checkpoint, the complete suite passed all 143 tests. Its twelve
+Stage 4 real-service scenarios include fresh database-clock behavior after a row
+lock wait and a worker subprocess killed after receiver capture with successful
+replacement recovery. That proves the encoded schedules, not every process-kill
+timing, exactly once, Stage 5 hostile-network safety, HA, or production capacity.
 
 ## Migration policy
 
-Run migrations explicitly with `alembic upgrade head`. The API and background
-processes never migrate at startup. Stage 2 revision `20260802_0001` creates the
-domain schema. Stage 3 revision `20260803_0002` adds recoverable outbox claim
-tokens/expiries, consistency constraints, and a partial claim-scan index.
+Run `alembic upgrade head` explicitly; application processes never migrate at
+startup.
 
-ORM models and migrations are separate artifacts. Changing one does not update
-the other or an existing database; review both and run `alembic check`.
+- `20260802_0001`: domain schema and transactional outbox.
+- `20260803_0002`: recoverable outbox publisher claims.
+- `20260804_0003`: retry schedule, delivery claim lease, generation, dead-letter
+  state/reason, attempt fencing, and per-generation outbox uniqueness.
+
+The Stage 4 upgrade converts any pre-existing unfinished Stage 3 attempts to
+`abandoned` and schedules their deliveries immediately. Downgrade intentionally
+refuses data Stage 3 cannot represent: active/scheduled/dead-lettered Stage 4
+state, any non-1 generation, or a `BIGINT` attempt duration outside the former
+32-bit range. Changing ORM models still does not migrate an existing database;
+review both artifacts and run `alembic check`.
 
 ## Documentation
 
@@ -310,6 +383,7 @@ the other or an existing database; review both and run `alembic check`.
 - [Stage 1: service foundation](docs/stages/01-foundation.md)
 - [Stage 2: durable event ingestion](docs/stages/02-event-ingestion.md)
 - [Stage 3: durable delivery pipeline](docs/stages/03-delivery-pipeline.md)
+- [Stage 4: failure recovery](docs/stages/04-failure-recovery.md)
 - [Architecture decision records](docs/decisions/README.md)
 
 ## License

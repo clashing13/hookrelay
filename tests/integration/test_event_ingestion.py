@@ -7,6 +7,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
@@ -585,6 +586,7 @@ async def test_composite_foreign_keys_reject_cross_tenant_domain_rows(
         await session.rollback()
     assert "fk_deliveries_tenant_id_endpoint_id" in str(delivery_error.value.orig)
 
+    completed_at = datetime.now(UTC)
     async with assertion_database.session_factory() as session:
         session.add(
             DeliveryAttempt(
@@ -592,6 +594,9 @@ async def test_composite_foreign_keys_reject_cross_tenant_domain_rows(
                 tenant_id=tenant_b.id,
                 delivery_id=valid_delivery.id,
                 attempt_number=1,
+                started_at=completed_at,
+                finished_at=completed_at,
+                outcome="succeeded",
             )
         )
         with pytest.raises(IntegrityError) as attempt_error:
