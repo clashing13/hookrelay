@@ -1,6 +1,21 @@
 # Patch and Debian-suite tags are deliberate reproducibility pins. Refresh them
 # through a reviewed change that rebuilds and tests the image for vulnerabilities.
 ARG PYTHON_IMAGE=python:3.12.13-slim-bookworm
+ARG NODE_IMAGE=node:24.14.0-bookworm-slim
+
+FROM ${NODE_IMAGE} AS console-builder
+
+ARG PNPM_VERSION=11.16.0
+
+WORKDIR /web
+
+RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
+
+COPY web/package.json web/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+
+COPY web ./
+RUN pnpm run build
 
 FROM ${PYTHON_IMAGE} AS builder
 
@@ -21,6 +36,9 @@ COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
+# Console files are built once, copied into the root-owned Python package, and
+# remain read-only when the runtime drops to UID/GID 10001.
+COPY --from=console-builder /web/dist ./src/hookrelay/console_dist
 RUN uv sync --frozen --no-dev --no-editable
 
 
@@ -44,7 +62,7 @@ COPY migrations ./migrations
 
 USER 10001:10001
 
-EXPOSE 8000 9000
+EXPOSE 8000 9000 9100
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2).close()"]

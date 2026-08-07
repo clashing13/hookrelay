@@ -1,7 +1,7 @@
 name: hookrelay
 
 x-hookrelay-image: &hookrelay-image
-  image: hookrelay-api:stage5
+  image: hookrelay-api:stage6
   user: "10001:10001"
   read_only: true
   cap_drop:
@@ -15,6 +15,10 @@ x-hookrelay-image: &hookrelay-image
 x-hookrelay-runtime-environment: &hookrelay-runtime-environment
   HOOKRELAY_ENVIRONMENT: local
   HOOKRELAY_LOG_LEVEL: ${HOOKRELAY_LOG_LEVEL:-INFO}
+  HOOKRELAY_TELEMETRY_ENABLED: ${HOOKRELAY_TELEMETRY_ENABLED:-false}
+  HOOKRELAY_OTEL_EXPORTER_OTLP_ENDPOINT: ${HOOKRELAY_OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318/v1/traces}
+  HOOKRELAY_OTEL_EXPORT_TIMEOUT_SECONDS: ${HOOKRELAY_OTEL_EXPORT_TIMEOUT_SECONDS:-2}
+  HOOKRELAY_METRICS_ENABLED: ${HOOKRELAY_METRICS_ENABLED:-true}
   HOOKRELAY_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-hookrelay}:${POSTGRES_PASSWORD:-hookrelay-dev-only}@postgres:5432/${POSTGRES_DB:-hookrelay}
   HOOKRELAY_DATABASE_POOL_SIZE: ${HOOKRELAY_DATABASE_POOL_SIZE:-5}
   HOOKRELAY_DATABASE_MAX_OVERFLOW: ${HOOKRELAY_DATABASE_MAX_OVERFLOW:-10}
@@ -92,6 +96,10 @@ services:
     command: ["hookrelay-outbox"]
     environment:
       <<: *hookrelay-runtime-environment
+      HOOKRELAY_METRICS_HOST: 0.0.0.0
+      HOOKRELAY_OUTBOX_METRICS_PORT: "9101"
+    expose:
+      - "9101"
     depends_on:
       postgres:
         condition: service_healthy
@@ -107,6 +115,10 @@ services:
     command: ["hookrelay-worker"]
     environment:
       <<: *hookrelay-runtime-environment
+      HOOKRELAY_METRICS_HOST: 0.0.0.0
+      HOOKRELAY_WORKER_METRICS_PORT: "9102"
+    expose:
+      - "9102"
     depends_on:
       postgres:
         condition: service_healthy
@@ -185,6 +197,91 @@ services:
       start_period: 5s
     stop_grace_period: 30s
 
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.158.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    profiles: ["observability"]
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      - tempo
+    expose:
+      - "4318"
+      - "13133"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    stop_grace_period: 10s
+
+  tempo:
+    image: grafana/tempo:2.10.5
+    command: ["-config.file=/etc/tempo.yaml"]
+    profiles: ["observability"]
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    expose:
+      - "3200"
+      - "4318"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+
+  prometheus:
+    image: prom/prometheus:v3.12.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=24h
+    profiles: ["observability"]
+    volumes:
+      - ./observability/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
+    depends_on:
+      - api
+      - outbox-publisher
+      - worker
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+
+  grafana:
+    image: grafana/grafana:13.1.0
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-hookrelay-local-only}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_HOST_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+      - tempo
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+
 volumes:
   postgres_data:
   nats_data:
+  prometheus_data:
+  tempo_data:
+  grafana_data:

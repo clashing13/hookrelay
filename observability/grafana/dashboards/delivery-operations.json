@@ -1,0 +1,108 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"expr": "sum by (route, status_class) (rate(hookrelay_api_requests_total[5m]))", "legendFormat": "{{route}} {{status_class}}"}],
+      "title": "API request rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0},
+      "id": 2,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"expr": "sum(rate(hookrelay_api_requests_total{route=\"/v1/events\",status_class=\"2xx\"}[5m]))", "legendFormat": "accepted event requests"}, {"expr": "sum(rate(hookrelay_outbox_messages_published_total[5m]))", "legendFormat": "published deliveries"}],
+      "title": "Ingress and publication throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0},
+      "id": 3,
+      "options": {"legend": {"displayMode": "table", "placement": "right"}},
+      "targets": [{"expr": "sum by (outcome) (increase(hookrelay_delivery_attempts_total[15m]))", "legendFormat": "{{outcome}}"}],
+      "title": "Delivery outcomes (15m)",
+      "type": "piechart"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "id": 4,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(hookrelay_delivery_attempt_duration_seconds_bucket[5m])))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(hookrelay_delivery_attempt_duration_seconds_bucket[5m])))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(hookrelay_delivery_attempt_duration_seconds_bucket[5m])))", "legendFormat": "p99"}
+      ],
+      "title": "Attempt latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "id": 5,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"expr": "sum by (reason) (rate(hookrelay_delivery_deferrals_total[5m]))", "legendFormat": "deferred {{reason}}"},
+        {"expr": "sum by (state) (rate(hookrelay_worker_message_results_total{state=~\"succeeded|dead_lettered\"}[5m]))", "legendFormat": "terminal {{state}}"}
+      ],
+      "title": "Deferrals, retries, and dead letters",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 16},
+      "id": 6,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"expr": "sum(hookrelay_worker_messages_in_flight)", "legendFormat": "in flight"}],
+      "title": "Worker in flight",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 16},
+      "id": 7,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"expr": "sum by (disposition, result) (rate(hookrelay_worker_broker_dispositions_total[5m]))", "legendFormat": "{{disposition}} {{result}}"}],
+      "title": "Broker dispositions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 16},
+      "id": 8,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"expr": "sum(rate(hookrelay_api_requests_total{status_class=~\"2xx|3xx\"}[5m])) / clamp_min(sum(rate(hookrelay_api_requests_total[5m])), 1e-9)", "legendFormat": "success ratio"}],
+      "title": "API success ratio",
+      "type": "gauge"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 41,
+  "tags": ["hookrelay", "delivery", "stage6"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "title": "HookRelay Delivery Operations",
+  "uid": "hookrelay-delivery-operations",
+  "version": 1,
+  "weekStart": ""
+}
