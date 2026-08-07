@@ -339,7 +339,26 @@ class Delivery(CreatedAtMixin, Base):
             "claim_expires_at IS NULL OR claim_expires_at > created_at",
             name="claim_expiry_after_creation",
         ),
-        Index("ix_deliveries_tenant_id_status_created_at", "tenant_id", "status", "created_at"),
+        Index(
+            "ix_deliveries_tenant_id_status_created_at",
+            "tenant_id",
+            "status",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_deliveries_tenant_id_created_at_id",
+            "tenant_id",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_deliveries_tenant_id_endpoint_id_created_at_id",
+            "tenant_id",
+            "endpoint_id",
+            "created_at",
+            "id",
+        ),
         Index(
             "ix_deliveries_retry_scheduled_next_attempt_at",
             "next_attempt_at",
@@ -480,6 +499,10 @@ class OutboxMessage(CreatedAtMixin, Base):
             name="published_message_not_claimed",
         ),
         CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload_is_object"),
+        CheckConstraint(
+            "traceparent IS NULL OR traceparent ~ '^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$'",
+            name="traceparent_canonical",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -497,6 +520,13 @@ class OutboxMessage(CreatedAtMixin, Base):
     )
     topic: Mapped[str] = mapped_column(String(100), nullable=False)
     payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    correlation_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=False,
+        default=uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    traceparent: Mapped[str | None] = mapped_column(String(55))
     claim_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
     claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

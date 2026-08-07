@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     )
 
     service_name: Literal["hookrelay"] = "hookrelay"
-    version: Literal["0.5.0"] = "0.5.0"
+    version: Literal["0.6.0"] = "0.6.0"
     environment: Literal["local", "test", "staging", "production"] = "local"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     host: str = "127.0.0.1"
@@ -76,6 +76,16 @@ class Settings(BaseSettings):
     delivery_circuit_failure_threshold: int = Field(default=5, ge=1, le=100)
     delivery_circuit_cooldown_seconds: float = Field(default=30.0, ge=1, le=86_400)
     delivery_allowed_hosts: frozenset[str] = frozenset({"127.0.0.1", "localhost", "receiver"})
+    telemetry_enabled: bool = False
+    otel_exporter_otlp_endpoint: str | None = None
+    otel_export_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    otel_batch_schedule_delay_seconds: float = Field(default=0.2, ge=0.05, le=5)
+    otel_batch_max_queue_size: int = Field(default=2048, ge=64, le=65_536)
+    otel_batch_max_export_batch_size: int = Field(default=512, ge=1, le=4096)
+    metrics_enabled: bool = True
+    metrics_host: str = "127.0.0.1"
+    outbox_metrics_port: int = Field(default=9101, ge=1, le=65535)
+    worker_metrics_port: int = Field(default=9102, ge=1, le=65535)
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -164,6 +174,43 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return value
 
+    @field_validator("otel_exporter_otlp_endpoint")
+    @classmethod
+    def require_http_otlp_endpoint(cls, value: str | None) -> str | None:
+        """Keep the optional OTLP/HTTP destination bounded and credential-free."""
+
+        if value is None:
+            return None
+        normalized = value.strip()
+        parsed = urlsplit(normalized)
+        if (
+            len(normalized) > 2048
+            or parsed.scheme not in {"http", "https"}
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            msg = "otel_exporter_otlp_endpoint must be one credential-free HTTP(S) URL"
+            raise ValueError(msg)
+        return normalized
+
+    @field_validator("metrics_host")
+    @classmethod
+    def require_bounded_metrics_host(cls, value: str) -> str:
+        """Reject ambiguous listener hosts while allowing names and IP literals."""
+
+        normalized = value.strip()
+        if (
+            not normalized
+            or len(normalized) > 255
+            or any(character.isspace() for character in normalized)
+        ):
+            msg = "metrics_host must be a non-empty hostname or IP literal"
+            raise ValueError(msg)
+        return normalized
+
     @field_validator("delivery_allowed_hosts")
     @classmethod
     def normalize_delivery_allowed_hosts(cls, value: frozenset[str]) -> frozenset[str]:
@@ -218,6 +265,12 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         if self.max_event_payload_bytes > self.max_request_body_bytes:
             msg = "max_event_payload_bytes must not exceed max_request_body_bytes"
+            raise ValueError(msg)
+        if self.telemetry_enabled and self.otel_exporter_otlp_endpoint is None:
+            msg = "enabled telemetry requires otel_exporter_otlp_endpoint"
+            raise ValueError(msg)
+        if self.otel_batch_max_export_batch_size > self.otel_batch_max_queue_size:
+            msg = "otel_batch_max_export_batch_size must not exceed otel_batch_max_queue_size"
             raise ValueError(msg)
         worst_case_batch_publish_seconds = (
             self.outbox_batch_size * self.nats_publish_timeout_seconds

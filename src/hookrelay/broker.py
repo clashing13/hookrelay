@@ -23,6 +23,7 @@ from nats.js.errors import APIError, NotFoundError
 from pydantic import BaseModel, ConfigDict
 
 from hookrelay.config import Settings
+from hookrelay.observability import inject_message_context
 
 OUTBOX_SCHEMA_VERSION = 1
 OUTBOX_TOPIC = "delivery.requested"
@@ -234,16 +235,18 @@ class JetStreamBroker:
     async def publish(self, message: DeliveryRequestedMessage) -> PublishReceipt:
         """Publish ID-only bytes and wait for JetStream's persistence acknowledgement."""
 
+        headers = {
+            NATS_MESSAGE_ID_HEADER: str(message.message_id),
+            "Content-Type": "application/json",
+            "HookRelay-Schema-Version": str(message.schema_version),
+        }
+        inject_message_context(headers)
         acknowledgement: PubAck = await self.jetstream.publish(
             self._settings.nats_subject,
             encode_delivery_message(message),
             timeout=self._settings.nats_publish_timeout_seconds,
             stream=self._settings.nats_stream_name,
-            headers={
-                NATS_MESSAGE_ID_HEADER: str(message.message_id),
-                "Content-Type": "application/json",
-                "HookRelay-Schema-Version": str(message.schema_version),
-            },
+            headers=headers,
         )
         if acknowledgement.stream != self._settings.nats_stream_name:
             msg = "JetStream acknowledged an unexpected stream"

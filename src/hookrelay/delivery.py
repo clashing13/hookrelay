@@ -13,6 +13,7 @@ from typing import Literal, cast
 from uuid import UUID, uuid4
 
 import httpx2 as httpx
+from opentelemetry.trace import SpanKind, Status, StatusCode
 from pydantic import JsonValue, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -28,6 +29,7 @@ from hookrelay.destination_policy import (
     DestinationPolicyBlocked,
     SSRFSafeAsyncTransport,
 )
+from hookrelay.metrics import HookRelayMetrics
 from hookrelay.models import (
     Delivery,
     DeliveryAttempt,
@@ -36,6 +38,7 @@ from hookrelay.models import (
     Event,
     OutboxMessage,
 )
+from hookrelay.observability import NOOP_TELEMETRY, Telemetry
 from hookrelay.security import SecretCipher
 from hookrelay.traffic_control import admit_endpoint_traffic, record_circuit_outcome
 
@@ -233,6 +236,8 @@ class DeliveryExecutor:
         secret_cipher: SecretCipher,
         http_client: httpx.AsyncClient,
         *,
+        telemetry: Telemetry | None = None,
+        metrics: HookRelayMetrics | None = None,
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         random_source: Callable[[], float] = random.random,
@@ -242,6 +247,8 @@ class DeliveryExecutor:
         self._session_factory = session_factory
         self._secret_cipher = secret_cipher
         self._http_client = http_client
+        self._telemetry = telemetry or NOOP_TELEMETRY
+        self._metrics = metrics
         self._destination_policy = DestinationPolicy(
             environment=settings.environment,
             local_exempt_hosts=settings.delivery_allowed_hosts,
@@ -250,6 +257,20 @@ class DeliveryExecutor:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._monotonic = monotonic
         self._random_source = random_source
+
+    def _observe_attempt(
+        self,
+        *,
+        outcome: str,
+        circuit_probe: bool,
+        duration_ms: int,
+    ) -> None:
+        if self._metrics is not None:
+            self._metrics.observe_attempt(
+                outcome=outcome,
+                circuit_probe=circuit_probe,
+                duration_seconds=max(0, duration_ms) / 1000,
+            )
 
     def _retry_delay(self, generation_attempt_number: int) -> float:
         return retry_delay_seconds(
@@ -469,6 +490,11 @@ class DeliveryExecutor:
                 if generation_attempts >= self._settings.delivery_max_attempts:
                     self._dead_letter(delivery, database_now, "attempts_exhausted")
                     await session.commit()
+                    self._observe_attempt(
+                        outcome="abandoned",
+                        circuit_probe=unfinished_attempt.is_circuit_probe,
+                        duration_ms=int(unfinished_attempt.duration_ms or 0),
+                    )
                     return DeliveryExecutionResult("dead_lettered")
                 delay = self._retry_delay(generation_attempts)
                 retry_at = self._respect_open_circuit(
@@ -482,6 +508,11 @@ class DeliveryExecutor:
                     retry_at=retry_at,
                 )
                 await session.commit()
+                self._observe_attempt(
+                    outcome="abandoned",
+                    circuit_probe=unfinished_attempt.is_circuit_probe,
+                    duration_ms=int(unfinished_attempt.duration_ms or 0),
+                )
                 return result
 
             if unfinished_attempt is not None:
@@ -531,6 +562,8 @@ class DeliveryExecutor:
                     retry_at=admission.retry_at,
                 )
                 await session.commit()
+                if self._metrics is not None and admission.reason is not None:
+                    self._metrics.observe_delivery_deferral(admission.reason)
                 return result
 
             event = await session.scalar(
@@ -697,58 +730,105 @@ class DeliveryExecutor:
                     retry_at=retry_at,
                 )
             await session.commit()
+            self._observe_attempt(
+                outcome=outcome,
+                circuit_probe=work.circuit_probe,
+                duration_ms=duration_ms,
+            )
             return result
 
     async def execute(self, message: DeliveryRequestedMessage) -> DeliveryExecutionResult:
         """Claim, send, and durably finalize one message without holding DB locks over HTTP."""
 
-        claimed = await self._claim_attempt(message)
-        if isinstance(claimed, DeliveryExecutionResult):
-            return claimed
+        with self._telemetry.start_as_current_span(
+            "delivery execute",
+            attributes={
+                "messaging.message.id": str(message.message_id),
+                "hookrelay.delivery.id": str(message.delivery_id),
+                "hookrelay.event.id": str(message.event_id),
+            },
+        ) as delivery_span:
+            try:
+                claimed = await self._claim_attempt(message)
+                if isinstance(claimed, DeliveryExecutionResult):
+                    delivery_span.set_attribute("hookrelay.delivery.state", claimed.state)
+                    return claimed
 
-        timestamp = int(self._clock().astimezone(UTC).timestamp())
-        request = build_signed_request(claimed, timestamp, self._settings.version)
-        started = self._monotonic()
-        response_status_code: int | None = None
-        error_code: str | None = None
-        target_blocked = False
-        outcome: AttemptOutcome
-        try:
-            async with asyncio.timeout(self._settings.delivery_http_timeout_seconds):
-                async with self._http_client.stream(
-                    "POST",
-                    claimed.target_url,
-                    content=request.body,
-                    headers=request.headers,
-                ) as response:
-                    if 100 <= response.status_code <= 599:
-                        response_status_code = response.status_code
-                        outcome = classify_http_status(response.status_code)
-                    else:
+                delivery_span.set_attribute(
+                    "hookrelay.delivery.dispatch_generation",
+                    claimed.dispatch_generation,
+                )
+                delivery_span.set_attribute(
+                    "hookrelay.delivery.attempt_number",
+                    claimed.attempt_number,
+                )
+                timestamp = int(self._clock().astimezone(UTC).timestamp())
+                request = build_signed_request(claimed, timestamp, self._settings.version)
+                started = self._monotonic()
+                response_status_code: int | None = None
+                error_code: str | None = None
+                target_blocked = False
+                outcome: AttemptOutcome
+                with self._telemetry.start_as_current_span(
+                    "webhook send",
+                    kind=SpanKind.CLIENT,
+                    attributes={
+                        "http.request.method": "POST",
+                        "url.scheme": httpx.URL(claimed.target_url).scheme,
+                    },
+                ) as http_span:
+                    try:
+                        async with asyncio.timeout(self._settings.delivery_http_timeout_seconds):
+                            async with self._http_client.stream(
+                                "POST",
+                                claimed.target_url,
+                                content=request.body,
+                                headers=request.headers,
+                            ) as response:
+                                if 100 <= response.status_code <= 599:
+                                    response_status_code = response.status_code
+                                    outcome = classify_http_status(response.status_code)
+                                else:
+                                    outcome = "permanent_failure"
+                                    error_code = "invalid_http_status"
+                                if outcome != "succeeded":
+                                    error_code = error_code or "http_status"
+                    except DestinationPolicyBlocked:
                         outcome = "permanent_failure"
-                        error_code = "invalid_http_status"
-                    if outcome != "succeeded":
-                        error_code = error_code or "http_status"
-        except DestinationPolicyBlocked:
-            outcome = "permanent_failure"
-            error_code = "target_blocked"
-            target_blocked = True
-        except TimeoutError:
-            outcome = "transient_failure"
-            error_code = "request_timeout"
-        except httpx.HTTPError:
-            outcome = "transient_failure"
-            error_code = "transport_error"
+                        error_code = "target_blocked"
+                        target_blocked = True
+                    except TimeoutError:
+                        outcome = "transient_failure"
+                        error_code = "request_timeout"
+                    except httpx.HTTPError:
+                        outcome = "transient_failure"
+                        error_code = "transport_error"
 
-        duration_ms = max(0, round((self._monotonic() - started) * 1000))
-        return await self._finish_attempt(
-            claimed,
-            outcome=outcome,
-            response_status_code=response_status_code,
-            error_code=error_code,
-            duration_ms=duration_ms,
-            target_blocked=target_blocked,
-        )
+                    if response_status_code is not None:
+                        http_span.set_attribute(
+                            "http.response.status_code",
+                            response_status_code,
+                        )
+                    http_span.set_attribute("hookrelay.attempt.outcome", outcome)
+                    if error_code is not None:
+                        http_span.set_attribute("error.type", error_code)
+                        http_span.set_status(Status(StatusCode.ERROR))
+
+                duration_ms = max(0, round((self._monotonic() - started) * 1000))
+                result = await self._finish_attempt(
+                    claimed,
+                    outcome=outcome,
+                    response_status_code=response_status_code,
+                    error_code=error_code,
+                    duration_ms=duration_ms,
+                    target_blocked=target_blocked,
+                )
+                delivery_span.set_attribute("hookrelay.delivery.state", result.state)
+                return result
+            except Exception as exc:
+                delivery_span.set_attribute("error.type", type(exc).__name__)
+                delivery_span.set_status(Status(StatusCode.ERROR))
+                raise
 
 
 def build_http_client(settings: Settings) -> httpx.AsyncClient:

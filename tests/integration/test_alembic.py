@@ -493,3 +493,181 @@ def test_stage4_dead_letter_checks_reject_invalid_terminal_rows(
             "dead_letter_reason": None,
         }
     ]
+
+
+def test_stage6_operations_migration_backfills_context_and_builds_keyset_indexes(
+    migration_database_url: str,
+) -> None:
+    """Prove Stage 6 preserves outbox rows and installs its exact query support."""
+
+    stage5 = _run_alembic(migration_database_url, "upgrade", "20260805_0004")
+    assert stage5.returncode == 0, stage5.stderr
+    seed = _new_database_seed()
+    _execute_batch(
+        migration_database_url,
+        [
+            *_domain_seed_statements(seed, delivery_status="pending"),
+            (
+                """
+                INSERT INTO outbox_messages (
+                    id, tenant_id, delivery_id, topic, payload
+                ) VALUES (
+                    :outbox_id, :tenant_id, :delivery_id, 'delivery.requested',
+                    CAST(:payload AS jsonb)
+                )
+                """,
+                {
+                    "outbox_id": seed.outbox_id,
+                    "tenant_id": seed.tenant_id,
+                    "delivery_id": seed.delivery_id,
+                    "payload": json.dumps({"schema_version": 1}),
+                },
+            ),
+        ],
+    )
+
+    stage6 = _run_alembic(migration_database_url, "upgrade", "20260806_0005")
+    assert stage6.returncode == 0, stage6.stderr
+    assert _fetch_all(
+        migration_database_url,
+        """
+        SELECT id, correlation_id, traceparent
+        FROM outbox_messages
+        WHERE id = :outbox_id
+        """,
+        {"outbox_id": seed.outbox_id},
+    ) == [
+        {
+            "id": seed.outbox_id,
+            "correlation_id": seed.outbox_id,
+            "traceparent": None,
+        }
+    ]
+
+    indexes = {
+        row["indexname"]: row["indexdef"]
+        for row in _fetch_all(
+            migration_database_url,
+            """
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'deliveries'
+              AND indexname IN (
+                'ix_deliveries_tenant_id_status_created_at',
+                'ix_deliveries_tenant_id_created_at_id',
+                'ix_deliveries_tenant_id_endpoint_id_created_at_id'
+              )
+            """,
+        )
+    }
+    assert set(indexes) == {
+        "ix_deliveries_tenant_id_status_created_at",
+        "ix_deliveries_tenant_id_created_at_id",
+        "ix_deliveries_tenant_id_endpoint_id_created_at_id",
+    }
+    assert (
+        "(tenant_id, status, created_at, id)"
+        in indexes["ix_deliveries_tenant_id_status_created_at"]
+    )
+    assert "(tenant_id, created_at, id)" in indexes["ix_deliveries_tenant_id_created_at_id"]
+    assert (
+        "(tenant_id, endpoint_id, created_at, id)"
+        in indexes["ix_deliveries_tenant_id_endpoint_id_created_at_id"]
+    )
+
+    valid_traceparent = f"00-{'a' * 32}-{'b' * 16}-01"
+    _execute_batch(
+        migration_database_url,
+        [
+            (
+                "UPDATE outbox_messages SET traceparent = :traceparent WHERE id = :outbox_id",
+                {"traceparent": valid_traceparent, "outbox_id": seed.outbox_id},
+            )
+        ],
+    )
+    with pytest.raises(IntegrityError, match="ck_outbox_messages_traceparent_canonical"):
+        _execute_batch(
+            migration_database_url,
+            [
+                (
+                    "UPDATE outbox_messages SET traceparent = :traceparent WHERE id = :outbox_id",
+                    {
+                        "traceparent": f"00-{'A' * 32}-{'b' * 16}-01",
+                        "outbox_id": seed.outbox_id,
+                    },
+                )
+            ],
+        )
+
+    defaulted_outbox_id = uuid4()
+    _execute_batch(
+        migration_database_url,
+        [
+            (
+                """
+                INSERT INTO outbox_messages (
+                    id, tenant_id, delivery_id, topic, payload, dispatch_generation
+                ) VALUES (
+                    :outbox_id, :tenant_id, :delivery_id, 'delivery.requested',
+                    CAST(:payload AS jsonb), 2
+                )
+                """,
+                {
+                    "outbox_id": defaulted_outbox_id,
+                    "tenant_id": seed.tenant_id,
+                    "delivery_id": seed.delivery_id,
+                    "payload": json.dumps({"schema_version": 1}),
+                },
+            )
+        ],
+    )
+    defaulted = _fetch_all(
+        migration_database_url,
+        """
+        SELECT correlation_id IS NOT NULL AS has_correlation
+        FROM outbox_messages
+        WHERE id = :outbox_id
+        """,
+        {"outbox_id": defaulted_outbox_id},
+    )
+    assert defaulted == [{"has_correlation": True}]
+
+    downgrade = _run_alembic(migration_database_url, "downgrade", "20260805_0004")
+    assert downgrade.returncode == 0, downgrade.stderr
+    columns = _fetch_all(
+        migration_database_url,
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'outbox_messages'
+          AND column_name IN ('correlation_id', 'traceparent')
+        """,
+    )
+    assert columns == []
+    old_index = _fetch_all(
+        migration_database_url,
+        """
+        SELECT indexdef
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND tablename = 'deliveries'
+          AND indexname = 'ix_deliveries_tenant_id_status_created_at'
+        """,
+    )
+    assert len(old_index) == 1
+    assert "(tenant_id, status, created_at)" in old_index[0]["indexdef"]
+    assert "(tenant_id, status, created_at, id)" not in old_index[0]["indexdef"]
+
+    reupgrade = _run_alembic(migration_database_url, "upgrade", "head")
+    assert reupgrade.returncode == 0, reupgrade.stderr
+    rebackfilled = _fetch_all(
+        migration_database_url,
+        """
+        SELECT id, correlation_id
+        FROM outbox_messages
+        ORDER BY id
+        """,
+    )
+    assert all(row["id"] == row["correlation_id"] for row in rebackfilled)
