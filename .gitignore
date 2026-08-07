@@ -7,6 +7,7 @@ __pycache__/
 
 # Virtual environments and local tooling
 .venv/
+.uv-cache/
 .coverage
 htmlcov/
 
@@ -28,4 +29,3 @@ Thumbs.db
 
 # Local database and test artifacts
 .test-data/
-

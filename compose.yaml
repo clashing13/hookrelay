@@ -1,0 +1,59 @@
+name: hookrelay
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hookrelay-api:stage1
+    environment:
+      HOOKRELAY_ENVIRONMENT: local
+      HOOKRELAY_LOG_LEVEL: ${HOOKRELAY_LOG_LEVEL:-INFO}
+      HOOKRELAY_HOST: 0.0.0.0
+      HOOKRELAY_PORT: "8000"
+      HOOKRELAY_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-hookrelay}:${POSTGRES_PASSWORD:-hookrelay-dev-only}@postgres:5432/${POSTGRES_DB:-hookrelay}
+      HOOKRELAY_DATABASE_POOL_SIZE: ${HOOKRELAY_DATABASE_POOL_SIZE:-5}
+      HOOKRELAY_DATABASE_MAX_OVERFLOW: ${HOOKRELAY_DATABASE_MAX_OVERFLOW:-10}
+      HOOKRELAY_READINESS_TIMEOUT_SECONDS: ${HOOKRELAY_READINESS_TIMEOUT_SECONDS:-2}
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2).close()
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    init: true
+    stop_grace_period: 10s
+
+  postgres:
+    # Keep the PostgreSQL patch and Debian suite explicit. Update this pin only
+    # in a reviewed change accompanied by backup/restore and compatibility checks.
+    image: postgres:17.7-bookworm
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hookrelay}
+      POSTGRES_USER: ${POSTGRES_USER:-hookrelay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hookrelay-dev-only}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready --username "$${POSTGRES_USER}" --dbname "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    stop_grace_period: 30s
+
+volumes:
+  postgres_data:
