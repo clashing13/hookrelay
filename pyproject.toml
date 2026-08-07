@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hookrelay"
-version = "0.1.0"
+version = "0.2.0"
 description = "A fault-tolerant webhook delivery platform"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -15,6 +15,7 @@ authors = [
 dependencies = [
   "alembic>=1.18.5,<2",
   "asyncpg>=0.30,<1",
+  "cryptography>=49,<50",
   "fastapi==0.141.1",
   "pydantic-settings>=2.14.2,<3",
   "sqlalchemy[asyncio]>=2.0.51,<3",
@@ -44,6 +45,8 @@ asyncio_mode = "strict"
 testpaths = ["tests"]
 markers = [
   "integration: requires a real PostgreSQL instance",
+  "concurrency: exercises behavior under overlapping requests or transactions",
+  "security: verifies authentication, isolation, encryption, and redaction contracts",
 ]
 
 [tool.ruff]

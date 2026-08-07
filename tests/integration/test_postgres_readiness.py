@@ -15,6 +15,8 @@ pytestmark = pytest.mark.integration
 async def test_readiness_executes_against_real_postgresql() -> None:
     database_url = os.getenv("HOOKRELAY_TEST_DATABASE_URL")
     if database_url is None:
+        if os.getenv("CI") == "true":
+            pytest.fail("CI must configure HOOKRELAY_TEST_DATABASE_URL")
         pytest.skip("HOOKRELAY_TEST_DATABASE_URL is not configured")
 
     settings = Settings(

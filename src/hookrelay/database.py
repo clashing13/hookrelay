@@ -3,7 +3,12 @@
 from typing import Protocol
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from hookrelay.config import Settings
 
@@ -28,12 +33,19 @@ class PostgresDatabase:
             pool_size=settings.database_pool_size,
             max_overflow=settings.database_max_overflow,
         )
+        self._session_factory = async_sessionmaker(self._engine, expire_on_commit=False)
 
     @property
     def engine(self) -> AsyncEngine:
         """Expose the engine for future short-lived unit-of-work session factories."""
 
         return self._engine
+
+    @property
+    def session_factory(self) -> async_sessionmaker[AsyncSession]:
+        """Create independent short-lived sessions for API units of work."""
+
+        return self._session_factory
 
     async def check_readiness(self) -> None:
         """Acquire a pooled connection and ask PostgreSQL to evaluate ``SELECT 1``."""

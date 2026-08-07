@@ -64,11 +64,22 @@ jobs:
       - name: Run unit and API tests
         run: uv run pytest -m "not integration"
 
-      - name: Run PostgreSQL integration tests
-        run: uv run pytest -m integration
-
       - name: Validate and apply Alembic migrations
         run: uv run alembic upgrade head
+
+      - name: Validate migration downgrade and re-upgrade
+        run: |
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+
+      - name: Run PostgreSQL integration tests
+        run: uv run pytest -m "integration and not concurrency"
+
+      - name: Run PostgreSQL concurrency tests
+        run: uv run pytest -m concurrency
+
+      - name: Check model and migration alignment
+        run: uv run alembic check
 
       - name: Validate Compose and build the image
         run: |

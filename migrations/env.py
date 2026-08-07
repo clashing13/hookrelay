@@ -8,15 +8,14 @@ from sqlalchemy import Connection, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from hookrelay.config import Settings
+from hookrelay.models import Base
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
-# Stage 1 has no domain tables. Stage 2 will import the shared declarative
-# Base.metadata here when the first meaningful schema is introduced.
-target_metadata = None
+target_metadata = Base.metadata
 
 
 def _database_url() -> str:
